@@ -816,7 +816,11 @@ class RerunStateMachine:
         return value >= self.max_values[context] * threshold
 
     def state_dict(
-        self, data_iterator: DataIteratorArgType, ckpt_format: str, force: bool = False
+        self,
+        data_iterator: DataIteratorArgType,
+        ckpt_format: str,
+        force: bool = False,
+        checkpoint_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> dict[str, Any]:
         """Method that returns a state dict to be checkpointed.
 
@@ -827,6 +831,8 @@ class RerunStateMachine:
             force: if True, emit the full state dict even when the machine is
                 disabled or no rerun is pending (used on the load path to
                 build a matching template).
+            checkpoint_group: The ranks forming one complete checkpoint. When
+                provided, the per-rank shard is indexed within this group.
         Returns:
             A state dict representing the rerun state machine, or None if
             rerun checkpointing is not applicable (mode is DISABLED, or the
@@ -909,8 +915,8 @@ class RerunStateMachine:
         sharded_dict = ShardedObject(
             "rerun_state_machine_state",
             sharded_dict,
-            (torch.distributed.get_world_size(),),
-            (torch.distributed.get_rank(),),
+            (torch.distributed.get_world_size(group=checkpoint_group),),
+            (torch.distributed.get_rank(group=checkpoint_group),),
         )
 
         state_dict: dict[str, Any] = {

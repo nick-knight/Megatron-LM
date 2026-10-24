@@ -57,6 +57,19 @@ class TestSaveTokenizerAssets:
         tokenizer_dir = os.path.join(checkpoint_path_fixture, "tokenizer")
         assert not os.path.exists(tokenizer_dir)
 
+    @patch("torch.distributed.is_initialized", return_value=True)
+    @patch("torch.distributed.get_rank", return_value=0)
+    def test_site_leader_saves_tokenizer_assets(
+        self, mock_get_rank, mock_dist_init, checkpoint_path_fixture
+    ):
+        site_group = object()
+        config = Mock(tokenizer_type="NullTokenizer")
+
+        save_tokenizer_assets(Mock(), config, checkpoint_path_fixture, checkpoint_group=site_group)
+
+        mock_get_rank.assert_called_once_with(group=site_group)
+        assert os.path.isdir(os.path.join(checkpoint_path_fixture, "tokenizer"))
+
     @patch("torch.distributed.is_initialized")
     @patch("torch.distributed.get_rank")
     @patch("megatron.training.checkpointing.logger")
