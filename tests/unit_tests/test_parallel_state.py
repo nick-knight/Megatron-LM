@@ -101,6 +101,133 @@ def test_initialize_model_parallel_with_cp_and_gtp_remat():
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize('order', ['tp-cp-ep-dp-pp', 'tp-cp-ep-pp-dp'])
+def test_multi_instance_optimizer_layout_accepts_builtin_orders(order):
+    """Dense and expert optimizer instances align for the built-in rank orders."""
+    if world_size != 8:
+        pytest.skip("Test requires eight ranks")
+
+    try:
+        Utils.initialize_model_parallel(
+            pipeline_model_parallel_size=2,
+            context_parallel_size=2,
+            expert_model_parallel_size=2,
+            num_distributed_optimizer_instances=2,
+            order=order,
+        )
+        assert ps.get_inter_distributed_optimizer_instance_group().size() == 2
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_multi_instance_optimizer_layout_rejects_custom_order():
+    """Divisible dense and expert replica sizes can still give different peers."""
+    if world_size != 8:
+        pytest.skip("Test requires eight ranks")
+
+    try:
+        with pytest.raises(ValueError, match="optimizer-instance layouts disagree"):
+            Utils.initialize_model_parallel(
+                context_parallel_size=2,
+                expert_model_parallel_size=2,
+                gtp_remat_size=1,
+                expert_gtp_remat_size=1,
+                num_distributed_optimizer_instances=2,
+                order='tp-cp-dp-ep-pp',
+            )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_site_groups_allow_nonuniform_instance_counts_across_three_sites():
+    """Two optimizer instances at one site and one at each of two other sites."""
+    if world_size != 8:
+        pytest.skip("Test requires eight ranks")
+
+    site_id = 0 if rank < 2 else 1 if rank < 6 else 2
+    expected = {0: (0, 1), 1: (2, 3, 4, 5), 2: (6, 7)}
+    try:
+        Utils.initialize_model_parallel(num_distributed_optimizer_instances=4)
+        ps.initialize_site_parallel(site_id, require_complete_optimizer_instances=True)
+        assert ps.get_site_id() == site_id
+        assert ps.get_site_global_ranks() == expected[site_id]
+        assert tuple(torch.distributed.get_process_group_ranks(ps.get_site_group())) == expected[
+            site_id
+        ]
+        for site_group, world_group in (
+            (ps.get_site_data_parallel_group(), ps.get_data_parallel_group()),
+            (
+                ps.get_site_data_parallel_group(with_context_parallel=True),
+                ps.get_data_parallel_group(with_context_parallel=True),
+            ),
+            (ps.get_site_expert_data_parallel_group(), ps.get_expert_data_parallel_group()),
+        ):
+            assert set(torch.distributed.get_process_group_ranks(site_group)) == set(
+                torch.distributed.get_process_group_ranks(world_group)
+            ).intersection(expected[site_id])
+    finally:
+        Utils.destroy_model_parallel()
+    assert ps.get_site_id() is None
+    assert ps.get_site_group(check_initialized=False) is None
+    assert ps.get_site_data_parallel_group(check_initialized=False) is None
+    assert ps.get_site_expert_data_parallel_group(check_initialized=False) is None
+
+
+def test_site_groups_reject_split_optimizer_instances():
+    """Contiguous site ranks are insufficient if PP interleaves the instances."""
+    if world_size != 8:
+        pytest.skip("Test requires eight ranks")
+
+    try:
+        Utils.initialize_model_parallel(
+            pipeline_model_parallel_size=2, num_distributed_optimizer_instances=2
+        )
+        with pytest.raises(ValueError, match="complete distributed-optimizer instances"):
+            ps.initialize_site_parallel(rank // 4, require_complete_optimizer_instances=True)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_site_groups_accept_pipeline_parallel_with_dp_outer_order():
+    if world_size != 8:
+        pytest.skip("Test requires eight ranks")
+
+    try:
+        Utils.initialize_model_parallel(
+            pipeline_model_parallel_size=2,
+            num_distributed_optimizer_instances=2,
+            order="tp-cp-ep-pp-dp",
+        )
+        ps.initialize_site_parallel(rank // 4, require_complete_optimizer_instances=True)
+        assert ps.get_site_global_ranks() == tuple(range((rank // 4) * 4, (rank // 4 + 1) * 4))
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_site_id_does_not_require_distributed_optimizer():
+    if world_size != 8:
+        pytest.skip("Test requires eight ranks")
+
+    try:
+        Utils.initialize_model_parallel()
+        ps.initialize_site_parallel(rank // 4)
+        assert ps.get_site_global_ranks() == tuple(range((rank // 4) * 4, (rank // 4 + 1) * 4))
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_site_groups_reject_split_model_replicas_without_distributed_optimizer():
+    if world_size != 8:
+        pytest.skip("Test requires eight ranks")
+
+    try:
+        Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
+        with pytest.raises(ValueError, match="complete model-parallel replicas"):
+            ps.initialize_site_parallel(rank // 4)
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.parametrize('order', test_parallel_order)
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
