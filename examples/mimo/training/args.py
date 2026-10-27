@@ -102,6 +102,11 @@ def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
 
 def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
     """Validate the disjoint hetero grid layout; returns ``(encoder_size, llm_size)``."""
+    if getattr(args, "site_id", None) is not None:
+        raise ValueError(
+            "Heterogeneous MIMO does not yet support --site-id: its per-module grids "
+            "do not create site-local optimizer or checkpoint groups"
+        )
     if args.mimo_llm_cp < 1:
         raise ValueError("--mimo-llm-cp must be positive")
     llm_data_parallel_size = get_language_batch_parallel_size(args)

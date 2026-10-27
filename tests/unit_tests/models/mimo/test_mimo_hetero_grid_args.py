@@ -80,6 +80,12 @@ def test_parser_uses_mimo_prefixed_destinations():
     }
 
 
+def test_heterogeneous_grid_rejects_unhandled_site_id():
+    args = _layout_8gpu_20l(site_id=0)
+    with pytest.raises(ValueError, match="does not yet support --site-id"):
+        validate_hetero_grid_args(args, WORLD_SIZE_8)
+
+
 @pytest.mark.parametrize("flag", OLD_GRID_FLAGS)
 def test_parser_rejects_unprefixed_grid_flags(flag):
     with pytest.raises(SystemExit):
