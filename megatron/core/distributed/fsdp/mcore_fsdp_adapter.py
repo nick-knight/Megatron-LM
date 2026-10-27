@@ -39,6 +39,7 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from megatron.core.distributed.hybrid_dp_mesh import build_hybrid_dp_mesh
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -652,7 +653,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             # There is no HSDP/HFSDP special case:
             # each axis takes the placements of its own strategy, so no_shard outer over
             # ZeRO-3 inner is HSDP and ZeRO-1 outer over ZeRO-3 inner is HFSDP.
-            dp_mesh = _build_hybrid_dp_mesh(
+            dp_mesh = build_hybrid_dp_mesh(
                 pg_collection.inter_dist_opt, pg_collection.intra_dp_cp, device_type
             )
             outer = _DATA_PARALLEL_PLACEMENTS[ddp_config.outer_dp_sharding_strategy]
@@ -1076,7 +1077,7 @@ def _build_expert_mesh_and_placements(
     if ddp_config.num_distributed_optimizer_instances > 1:
         # Match v1 topology: dense and expert parameters share the outer DP axis,
         # while experts use the existing expert-DP inner group. Only placements differ.
-        dp_mesh = _build_hybrid_dp_mesh(
+        dp_mesh = build_hybrid_dp_mesh(
             pg_collection.inter_dist_opt, pg_collection.intra_expt_dp, device_type
         )
         inner = _DATA_PARALLEL_PLACEMENTS[inner_strategy]
@@ -1100,44 +1101,6 @@ def _build_expert_mesh_and_placements(
         optimizer=[axis.optimizer],
     )
     return dp_mesh, placements
-
-
-def _build_hybrid_dp_mesh(outer_group, inner_group, device_type):
-    """Build the ("dp_outer", "dp_shard") mesh for a hybrid data-parallel domain."""
-    if outer_group is None or inner_group is None:
-        raise ValueError(
-            "MFSDP v2 hybrid sharding requires inter- and intra-instance process groups."
-        )
-
-    rank = dist.get_rank()
-    inner_ranks = dist.get_process_group_ranks(inner_group)
-    outer_ranks = dist.get_process_group_ranks(outer_group)
-    outer_offsets = torch.tensor(outer_ranks) - rank
-    inner_offsets = torch.tensor(inner_ranks) - rank
-    layout = rank + outer_offsets[:, None] + inner_offsets[None, :]
-
-    # Sort the mesh ranks into outer-to-inner order, then check that this rank's
-    # row and column match its inner and outer process groups, respectively.
-    expected_layout = layout.flatten().sort().values.reshape(layout.shape)
-    expected_inner = expected_layout[outer_group.rank()].tolist()
-    expected_outer = expected_layout[:, inner_group.rank()].tolist()
-    if inner_ranks != expected_inner:
-        raise ValueError(
-            f"MFSDP v2 hybrid mesh row {expected_inner} does not match the intra "
-            f"data-parallel group {inner_ranks}."
-        )
-    if outer_ranks != expected_outer:
-        raise ValueError(
-            f"MFSDP v2 hybrid mesh column {expected_outer} does not match the inter "
-            f"distributed-optimizer group {outer_ranks}."
-        )
-
-    return DeviceMesh.from_group(
-        [outer_group, inner_group],
-        device_type=device_type,
-        mesh=layout,
-        mesh_dim_names=("dp_outer", "dp_shard"),
-    )
 
 
 def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):

@@ -23,6 +23,7 @@ from ..transformer.transformer_config import TransformerConfig
 from ..transformer.transformer_layer import TransformerLayer
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
+from .hybrid_dp_mesh import build_hybrid_dp_mesh
 
 
 class TorchFullyShardedDataParallel(_BaseDataParallel):
@@ -78,7 +79,20 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
         else:
             self.process_group = process_group
 
-        self.device_mesh = DeviceMesh.from_group(self.process_group, "cuda")
+        if ddp_config.num_distributed_optimizer_instances > 1:
+            if process_group is not None:
+                raise ValueError("Hybrid Torch-FSDP2 requires the default data-parallel group")
+            self.device_mesh = build_hybrid_dp_mesh(
+                parallel_state.get_inter_distributed_optimizer_instance_group(),
+                parallel_state.get_data_parallel_group(
+                    with_context_parallel=True,
+                    with_gtp_remat=False,
+                    partial_data_parallel=True,
+                ),
+                "cuda",
+            )
+        else:
+            self.device_mesh = DeviceMesh.from_group(self.process_group, "cuda")
         kwargs = {
             "mesh": self.device_mesh,
             "reshard_after_forward": getattr(ddp_config, "reshard_after_forward", True),

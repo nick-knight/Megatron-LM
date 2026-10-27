@@ -130,6 +130,45 @@ def test_fsdp2_constructor_with_process_group(init_model_parallel):
     assert not _is_fsdp_wrapped_module(fsdp_model.module.module.conv)
 
 
+def test_fsdp2_hybrid_shards_within_site_and_replicates_across_sites():
+    """An eight-rank DP domain uses four-rank site-local shards and two outer replicas."""
+    if Utils.world_size != 8 or not is_torch_min_version("2.4.0"):
+        pytest.skip("Test requires eight ranks and PyTorch FSDP2")
+
+    try:
+        Utils.initialize_model_parallel(num_distributed_optimizer_instances=2)
+        parallel_state.initialize_site_parallel(
+            Utils.rank // 4, require_complete_optimizer_instances=True
+        )
+        config = TransformerConfig(num_layers=1, hidden_size=8, num_attention_heads=2, bf16=True)
+        torch.manual_seed(1234)
+        model = torch.nn.Linear(8, 8).cuda().to(torch.bfloat16)
+        fsdp_model = TorchFullyShardedDataParallel(
+            config,
+            DistributedDataParallelConfig(num_distributed_optimizer_instances=2),
+            model,
+        )
+        mesh = fsdp_model.device_mesh
+        assert mesh.mesh_dim_names == ("dp_outer", "dp_shard")
+        assert mesh.mesh.shape == (2, 4)
+        assert set(torch.distributed.get_process_group_ranks(mesh.get_group(mesh_dim=1))) == set(
+            parallel_state.get_site_global_ranks()
+        )
+
+        optimizer = torch.optim.SGD(fsdp_model.parameters(), lr=0.01)
+        inputs = torch.ones(2, 8, device="cuda", dtype=torch.bfloat16) * (Utils.rank + 1)
+        fsdp_model(inputs).float().square().mean().backward()
+        optimizer.step()
+        outer_group = mesh.get_group(mesh_dim=0)
+        for parameter in fsdp_model.parameters():
+            local_shard = parameter.to_local().detach()
+            gathered = [torch.empty_like(local_shard) for _ in range(2)]
+            torch.distributed.all_gather(gathered, local_shard, group=outer_group)
+            torch.testing.assert_close(gathered[0], gathered[1])
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.skipif(not is_torch_min_version("2.4.0"), reason="FSDP2 requires PyTorch >= 2.4")
 @pytest.mark.skipif(not HAVE_EINOPS, reason="einops is not available")
 @pytest.mark.skipif(not HAVE_DTENSOR, reason="DTensor is not available")

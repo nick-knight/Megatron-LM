@@ -2771,7 +2771,10 @@ def get_megatron_ddp_config(
 
     if use_torch_fsdp2:
         reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
-        return TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
+        return TorchFullyShardedDataParallelConfig(
+            reshard_after_forward=reshard_after_forward,
+            num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
+        )
     else:
         kwargs = {}
         for f in dataclasses.fields(DistributedDataParallelConfig):

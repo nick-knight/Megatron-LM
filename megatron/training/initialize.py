@@ -501,6 +501,8 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             require_complete_optimizer_instances=(
                 args.use_distributed_optimizer
                 or getattr(args, 'use_layer_wise_distributed_optimizer', False)
+                or args.use_megatron_fsdp
+                or args.use_torch_fsdp2
             ),
         )
 
