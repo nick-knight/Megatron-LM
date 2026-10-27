@@ -655,6 +655,28 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
     )
 
 
+def _default_site_checkpoint_groups(args, checkpoint_group, parallelization_group, *, loading):
+    """Use site-local groups for torch_dist when the caller supplied no checkpoint group."""
+    if checkpoint_group is not None or getattr(args, 'ckpt_format', None) != 'torch_dist':
+        return checkpoint_group, parallelization_group
+    site_group = mpu.get_site_group(check_initialized=False)
+    if site_group is None:
+        return checkpoint_group, parallelization_group
+    if parallelization_group is None:
+        kind = (
+            args.ckpt_fully_parallel_load_process_group
+            if loading
+            else args.ckpt_fully_parallel_save_process_group
+        )
+        if kind == 'dp':
+            parallelization_group = mpu.get_site_data_parallel_group(with_context_parallel=True)
+        elif kind == 'ep_dp':
+            parallelization_group = mpu.get_site_expert_data_parallel_group()
+        else:
+            raise ValueError(f'Invalid checkpoint parallelization group: {kind}')
+    return site_group, parallelization_group
+
+
 def save_checkpoint(
     iteration,
     model,
@@ -721,6 +743,9 @@ def save_checkpoint(
     """
     start_ckpt = time()
     args = get_args()
+    checkpoint_group, checkpoint_parallelization_group = _default_site_checkpoint_groups(
+        args, checkpoint_group, checkpoint_parallelization_group, loading=False
+    )
 
     if args.async_save and not is_empty_async_queue():
         print_rank_0(
@@ -2768,6 +2793,9 @@ def load_checkpoint(
     """
     cfg = get_run_config()
     args = get_args()
+    checkpoint_group, checkpoint_parallelization_group = _default_site_checkpoint_groups(
+        args, checkpoint_group, checkpoint_parallelization_group, loading=True
+    )
     if checkpoint_group is not None and preferred_reader_ranks is None:
         preferred_reader_ranks = ()
     load_dir = getattr(args, load_arg)

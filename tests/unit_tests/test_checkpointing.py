@@ -14,6 +14,7 @@ import torch.distributed as dist
 import torch.distributed.checkpoint
 import yaml
 
+from megatron.core import parallel_state as ps
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
@@ -886,18 +887,27 @@ def test_save_checkpoint(
 
 
 @pytest.mark.parametrize("fully_parallel", [False, True])
+@pytest.mark.parametrize("automatic_site_id", [False, True])
 def test_independent_training_checkpoint_domains(
-    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, run_config, fully_parallel
+    init_model_parallel,
+    create_ckpt_load_args,
+    tmp_path_dist_ckpt,
+    run_config,
+    fully_parallel,
+    automatic_site_id,
 ):
     """Each site can save and resume its own iteration and per-rank RNG state."""
     if Utils.world_size < 4 or Utils.world_size % 2:
         pytest.skip("Requires an even world size of at least four ranks")
 
     group_size = Utils.world_size // 2
+    domain_id = Utils.rank // group_size
+    if automatic_site_id:
+        Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=2)
+        ps.initialize_site_parallel(domain_id, require_complete_optimizer_instances=True)
     groups = [
         dist.new_group(ranks=list(range(start, start + group_size))) for start in (0, group_size)
     ]
-    domain_id = Utils.rank // group_size
     group = groups[domain_id]
     local_rank = dist.get_rank(group=group)
     first_done = tmp_path_dist_ckpt / f"training_domain_first_done_{fully_parallel}"
@@ -942,6 +952,7 @@ def test_independent_training_checkpoint_domains(
     args.load = checkpoint_dir
     args.dataloader_save = checkpoint_dir
     args.save_tokenizer_assets = False
+    args.site_id = domain_id if automatic_site_id else None
     set_args(args)
     run_config.rng.data_parallel_random_init = True
 
@@ -969,8 +980,10 @@ def test_independent_training_checkpoint_domains(
         None,
         17,
         train_data_iterator=data_iterator,
-        checkpoint_group=group,
-        checkpoint_parallelization_group=group if fully_parallel else None,
+        checkpoint_group=None if automatic_site_id else group,
+        checkpoint_parallelization_group=(
+            None if automatic_site_id else group if fully_parallel else None
+        ),
     )
     assert (checkpoint_dir / "latest_checkpointed_iteration.txt").read_text() == str(iteration)
     dataloader_file = (
@@ -992,8 +1005,10 @@ def test_independent_training_checkpoint_domains(
         [restored],
         None,
         None,
-        checkpoint_group=group,
-        checkpoint_parallelization_group=group if fully_parallel else None,
+        checkpoint_group=None if automatic_site_id else group,
+        checkpoint_parallelization_group=(
+            None if automatic_site_id else group if fully_parallel else None
+        ),
     ) == (iteration, 17)
     for actual in restored.parameters():
         torch.testing.assert_close(actual, torch.full_like(actual, domain_id + 1))
