@@ -427,8 +427,8 @@ class DistributedDataParallel(_BaseDataParallel):
         # Set `previous_grad_reduce_bucket_group` so each bucket group can drain its predecessor's
         # reduce-scatter at dispatch time. Only needed for reduce_scatter_with_fp32_accumulation,
         # which holds an intermediate all-to-all output tensor pinned until .wait() runs; without
-        # this draining, all such tensors stay live until end-of-step. The fp32-accum path asserts
-        # num_distributed_optimizer_instances == 1 elsewhere, so we only link in that case.
+        # this draining, all such tensors stay live until end-of-step. With multiple instances,
+        # each reduce-scatter finishes before the inter-instance all-reduce is launched.
         # Grad-reduce dispatches happen in forward order of bucket_groups during backward (buckets
         # closer to the output finish their gradients first), so bucket_groups[i]'s immediate
         # predecessor in dispatch order is bucket_groups[i-1].

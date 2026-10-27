@@ -274,9 +274,6 @@ class _ParamAndGradBucketGroup:
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             self.inter_distributed_optimizer_instance_group = None
             self.communication_stream = None
-            assert (
-                not self.ddp_config.reduce_scatter_with_fp32_accumulation
-            ), "RS w/ FP32 accumulation not supported with num_distributed_optimizer_instances > 1"
 
         reduction_collective = (
             "reduce-scatter" if self.ddp_config.use_distributed_optimizer else "all-reduce"

@@ -10,7 +10,11 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
+from megatron.core.distributed.param_and_grad_buffer import (
+    _ParamAndGradBuffer,
+    partition_buckets,
+    shard_buffer,
+)
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import TestModel, Utils
@@ -56,6 +60,7 @@ def get_model_and_buffers(
     average_in_collective: bool,
     num_distributed_optimizer_instances: int = 1,
     grad_reduce_in_fp32: bool = True,
+    reduce_scatter_with_fp32_accumulation: bool = False,
     param_name_patterns_for_fp32_local_accumulation: tuple = (),
 ):
     ddp_config = DistributedDataParallelConfig(
@@ -65,6 +70,7 @@ def get_model_and_buffers(
         bucket_size=bucket_size,
         average_in_collective=average_in_collective,
         num_distributed_optimizer_instances=num_distributed_optimizer_instances,
+        reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
         param_name_patterns_for_fp32_local_accumulation=param_name_patterns_for_fp32_local_accumulation,
     )
     model = TestModel(
@@ -368,6 +374,45 @@ def test_grad_sync(
             param_and_grad_buffer.grad_data.data.fill_(1.0)
 
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("overlap_grad_reduce", [False, True])
+def test_low_precision_grad_sync_with_multiple_optimizer_instances(overlap_grad_reduce: bool):
+    """A local BF16 all-to-all plus an inter-instance all-reduce yields the DP mean."""
+    if Utils.world_size != 8:
+        pytest.skip("Requires eight ranks")
+
+    try:
+        Utils.initialize_model_parallel(num_distributed_optimizer_instances=2)
+        model, buffer, bucket_groups = get_model_and_buffers(
+            input_dim=32,
+            output_dim=32,
+            num_layers=2,
+            bias=True,
+            shared_embedding=False,
+            bucket_size=None,
+            use_distributed_optimizer=True,
+            overlap_grad_reduce=overlap_grad_reduce,
+            average_in_collective=False,
+            num_distributed_optimizer_instances=2,
+            grad_reduce_in_fp32=False,
+            reduce_scatter_with_fp32_accumulation=True,
+        )
+        assert buffer.grad_data.dtype == torch.bfloat16
+        assert len(bucket_groups) == 1
+        buffer.grad_data.fill_(Utils.rank + 1)
+        model.finish_grad_sync()
+
+        intra_rank = parallel_state.get_data_parallel_rank(
+            with_context_parallel=True, partial_data_parallel=True
+        )
+        for bucket in bucket_groups[0].buckets:
+            local_shard = shard_buffer(bucket.grad_data, Utils.world_size // 2)[intra_rank]
+            torch.testing.assert_close(
+                local_shard, torch.full_like(local_shard, 4.5), rtol=0, atol=0
+            )
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("force_all_reduce", [False, True])
