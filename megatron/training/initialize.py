@@ -495,7 +495,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 f"{mpu.get_pipeline_model_parallel_world_size()}"
             )
 
-    if getattr(args, 'site_id', None) is not None:
+    if getattr(args, 'site_id', None) is not None and not skip_model_parallel_init:
         mpu.initialize_site_parallel(
             args.site_id,
             require_complete_optimizer_instances=(

@@ -122,10 +122,9 @@ class ColocatedBridgeCommunicator:
                 f"src={self.src_grid.size}, dest={self.dest_grid.size}"
             )
 
-        if self.src_grid.rank_offset != self.dest_grid.rank_offset:
+        if self.src_grid.rank_ids != self.dest_grid.rank_ids:
             raise ValueError(
-                f"Grids must have same rank offset: "
-                f"src={self.src_grid.rank_offset}, dest={self.dest_grid.rank_offset}"
+                "Colocated grids must have the same rank offset and ordered global ranks"
             )
 
         # Per-grid dim checks: tp/dp required; pp and cp (if present) must be 1.

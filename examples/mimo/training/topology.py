@@ -37,6 +37,7 @@ class ModuleGridSpec:
     ep: int = 1
     gtp_remat: int = 1
     rank_offset: int = 0
+    rank_ids: Optional[tuple[int, ...]] = None
     # Experts default to TP=1 (set explicitly for MoE); intentionally not Megatron's etp=tp default.
     expt_tp: int = 1
     expt_gtp_remat: int = 1
@@ -82,6 +83,8 @@ class HeteroTopology:
     grids: dict[str, HyperCommGrid]
     module_pgs: dict[str, ProcessGroupCollection]
     schedule_pg_collection: MultiModuleProcessGroupCollection
+    site_group: Optional[dist.ProcessGroup] = None
+    extra_groups: list[dist.ProcessGroup] = field(default_factory=list)
 
     def destroy(self) -> None:
         """Destroy every process group owned by this topology."""
@@ -94,10 +97,18 @@ class HeteroTopology:
                 destroyed.add(id(pg))
         for grid in self.grids.values():
             grid.destroy()
+        for pg in self.extra_groups:
+            if _is_process_group_member(pg) and id(pg) not in destroyed:
+                dist.destroy_process_group(pg)
+                destroyed.add(id(pg))
 
 
 def create_topology(
-    specs: list[ModuleGridSpec], high_priority_stream_groups: Optional[list[str]] = None
+    specs: list[ModuleGridSpec],
+    high_priority_stream_groups: Optional[list[str]] = None,
+    *,
+    site_ids: Optional[tuple[int, ...]] = None,
+    num_optimizer_instances: int = 1,
 ) -> HeteroTopology:
     """Build every module's grid, PGC, and embedding groups.
 
@@ -116,6 +127,8 @@ def create_topology(
 
     grids: dict[str, HyperCommGrid] = {}
     module_pgs: dict[str, ProcessGroupCollection] = {}
+    extra_groups = []
+    site_group = None
     try:
         for spec in specs:
             grids[spec.name] = _build_grid(spec, high_priority_stream_groups)
@@ -128,13 +141,102 @@ def create_topology(
                 high_priority_stream_groups=high_priority_stream_groups,
             )
 
+        if site_ids is not None:
+            if len(site_ids) != dist.get_world_size():
+                raise ValueError("MIMO site IDs must cover the distributed world")
+            for spec in specs:
+                if num_optimizer_instances > 1:
+                    extra_groups.extend(
+                        _add_optimizer_instance_groups(
+                            spec, grids[spec.name], module_pgs[spec.name],
+                            site_ids, num_optimizer_instances,
+                        )
+                    )
+            site_rank_lists = [
+                [rank for rank, value in enumerate(site_ids) if value == site]
+                for site in dict.fromkeys(site_ids)
+            ]
+            site_group, _ = dist.new_subgroups_by_enumeration(
+                site_rank_lists, backend="nccl"
+            )
+            extra_groups.append(site_group)
+
         schedule_pg_collection = build_schedule_pg_collection(grids, module_pgs, language_name)
         return HeteroTopology(
-            grids=grids, module_pgs=module_pgs, schedule_pg_collection=schedule_pg_collection
+            grids=grids, module_pgs=module_pgs, schedule_pg_collection=schedule_pg_collection,
+            site_group=site_group, extra_groups=extra_groups,
         )
     except Exception:
-        HeteroTopology(grids=grids, module_pgs=module_pgs, schedule_pg_collection=None).destroy()
+        HeteroTopology(
+            grids=grids, module_pgs=module_pgs, schedule_pg_collection=None,
+            site_group=site_group, extra_groups=extra_groups,
+        ).destroy()
         raise
+
+
+def _add_optimizer_instance_groups(spec, grid, pgc, site_ids, instances):
+    """Split a module's DP domains into local shards and matching outer peers."""
+    if spec.rank_ids is None:
+        raise ValueError("Site-major MIMO requires explicit module rank IDs")
+    if spec.dp % instances or spec.expt_dp % instances:
+        raise ValueError(
+            f"Module {spec.name} optimizer instances must divide dense and expert DP sizes"
+        )
+
+    dense_stride = spec.tp * spec.cp * spec.gtp_remat
+    inner_dp = spec.dp // instances
+    by_instance = [[] for _ in range(instances)]
+    instance_for_rank = {}
+    for index, rank in enumerate(grid.rank_ids):
+        instance = ((index // dense_stride) % spec.dp) // inner_dp
+        by_instance[instance].append(rank)
+        instance_for_rank[rank] = instance
+    for ranks in by_instance:
+        if len({site_ids[rank] for rank in ranks}) != 1:
+            raise ValueError(f"Module {spec.name} has an optimizer instance split across sites")
+
+    def split_group_domain(full_groups, label):
+        intra_groups, inter_groups = [], []
+        for full in full_groups:
+            parts = [[rank for rank in full if instance_for_rank[rank] == i]
+                     for i in range(instances)]
+            if any(len(part) != len(full) // instances for part in parts):
+                raise ValueError(
+                    f"Module {spec.name} {label} group is not evenly split across instances"
+                )
+            intra_groups.extend(parts)
+            inter_groups.extend(
+                [[part[offset] for part in parts] for offset in range(len(parts[0]))]
+            )
+        return intra_groups, inter_groups
+
+    dense_dims, dense_view = _dense_group_dims(
+        "gtp_remat_sequence_shards" in grid.dim_names
+    )["dp_cp"]
+    dense_intra, dense_inter = split_group_domain(
+        grid.get_rank_enum(dense_dims, view=dense_view), "dense DP"
+    )
+    expert_intra, expert_inter = split_group_domain(
+        grid.get_rank_enum("expt_dp", view=_EXPERT_VIEW), "expert DP"
+    )
+    dense_peers = {rank: tuple(peers) for peers in dense_inter for rank in peers}
+    expert_peers = {rank: tuple(peers) for peers in expert_inter for rank in peers}
+    if dense_peers != expert_peers:
+        raise ValueError(
+            f"Module {spec.name} dense and expert layouts assign different inter-instance peers"
+        )
+
+    groups = []
+    for field_name, rank_lists in (
+        ("intra_dp_cp", dense_intra),
+        ("intra_expt_dp", expert_intra),
+        ("inter_dist_opt", dense_inter),
+        ("intra_dist_opt", by_instance),
+    ):
+        group, _ = dist.new_subgroups_by_enumeration(rank_lists, backend="nccl")
+        setattr(pgc, field_name, group)
+        groups.append(group)
+    return groups
 
 
 def _build_grid(
@@ -162,6 +264,7 @@ def _build_grid(
         ),
         rank_offset=spec.rank_offset,
         backend="nccl",
+        rank_ids=list(spec.rank_ids) if spec.rank_ids is not None else None,
     )
     if layout is not None:
         # CP and GTP sequence shards share a sample; the remaining GTP extent
@@ -244,34 +347,34 @@ def _validate_grid_layout(grids: dict[str, HyperCommGrid]) -> None:
     """Assert grids tile the world disjointly (non-colocated) XOR fully share ranks (colocated),
     with no gaps. Colocated-vs-not is decided via the core ``RankRole.build`` path.
     """
-    spans = {name: (g.rank_offset, g.rank_offset + g.size) for name, g in grids.items()}
-    names = list(spans)
-    all_same = all(spans[n] == spans[names[0]] for n in names)
+    rank_sets = {name: set(g.rank_ids) for name, g in grids.items()}
+    names = list(rank_sets)
+    all_same = all(rank_sets[n] == rank_sets[names[0]] for n in names)
     pairwise_disjoint = all(
-        spans[a][1] <= spans[b][0] or spans[b][1] <= spans[a][0]
+        rank_sets[a].isdisjoint(rank_sets[b])
         for i, a in enumerate(names)
         for b in names[i + 1 :]
     )
     if not (all_same or pairwise_disjoint):
         raise ValueError(
-            f"Module grids must either fully share ranks or be pairwise disjoint, got {spans}"
+            f"Module grids must either fully share ranks or be pairwise disjoint, got {rank_sets}"
         )
 
     # Disjoint spans must also leave no rank uncovered (their union == [0, world_size)).
     world_size = dist.get_world_size()
     covered_ranks: set[int] = set()
-    for start, end in spans.values():
-        covered_ranks.update(range(start, end))
+    for ranks in rank_sets.values():
+        covered_ranks.update(ranks)
     if covered_ranks != set(range(world_size)):
         raise ValueError(
-            f"Module grids must partition the world [0, {world_size}) with no gaps, got {spans}"
+            f"Module grids must partition the world [0, {world_size}) with no gaps, got {rank_sets}"
         )
 
     modality_names = [n for n in names if n != MIMO_LANGUAGE_MODULE_KEY]
     role = RankRole.build(modality_names, grids)
     expected = ModuleLayout.COLOCATED if all_same else ModuleLayout.NON_COLOCATED
     if role.mode is not expected:
-        raise ValueError(f"RankRole reported {role.mode} but rank spans imply {expected}: {spans}")
+        raise ValueError(f"RankRole reported {role.mode} but rank sets imply {expected}: {rank_sets}")
 
 
 def pg_collection_from_grid(

@@ -102,11 +102,6 @@ def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
 
 def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
     """Validate the disjoint hetero grid layout; returns ``(encoder_size, llm_size)``."""
-    if getattr(args, "site_id", None) is not None:
-        raise ValueError(
-            "Heterogeneous MIMO does not yet support --site-id: its per-module grids "
-            "do not create site-local optimizer or checkpoint groups"
-        )
     if args.mimo_llm_cp < 1:
         raise ValueError("--mimo-llm-cp must be positive")
     llm_data_parallel_size = get_language_batch_parallel_size(args)
@@ -166,6 +161,11 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
         )
 
     encoder_size = args.mimo_encoder_tp * args.mimo_encoder_dp
+    if getattr(args, "site_id", None) is not None:
+        if encoder_size + llm_size != world_size:
+            raise ValueError("Site-major MIMO requires encoder and language ranks to fill WORLD_SIZE")
+        args.mimo_llm_world_size = llm_size
+        return encoder_size, llm_size
     encoder_ranks = set(range(encoder_size))  # encoder span always starts at rank 0
     llm_ranks = set(range(args.mimo_llm_offset, args.mimo_llm_offset + llm_size))
     all_ranks = set(range(world_size))
@@ -190,6 +190,8 @@ def build_module_grid_specs(
 ) -> List[ModuleGridSpec]:
     """Map grid args to the ModuleGridSpec list create_topology consumes."""
     encoder_size, llm_size = validate_hetero_grid_args(args, world_size)
+    if getattr(args, "site_id", None) is not None and not hasattr(args, "_mimo_site_rank_ids"):
+        raise ValueError("Call configure_site_rank_layout before building site-major MIMO grids")
     gtp_weight_remat_size, expert_gtp_weight_remat_size = resolve_hetero_gtp_degrees(args)
     _, gtp_remat_num_sequence_shards = resolve_tensor_parallel_sequence_shards(
         args.mimo_llm_tp,
@@ -207,7 +209,8 @@ def build_module_grid_specs(
         ep=args.mimo_llm_ep,
         gtp_remat=gtp_weight_remat_size,
         gtp_remat_num_sequence_shards=gtp_remat_num_sequence_shards,
-        rank_offset=args.mimo_llm_offset,
+        rank_offset=0 if getattr(args, "site_id", None) is not None else args.mimo_llm_offset,
+        rank_ids=getattr(args, "_mimo_site_rank_ids", {}).get(MIMO_LANGUAGE_MODULE_KEY),
         expt_tp=args.mimo_llm_expt_tp or 1,
         expt_gtp_remat=expert_gtp_weight_remat_size,
     )
@@ -223,9 +226,108 @@ def build_module_grid_specs(
         pp=1,
         ep=1,
         rank_offset=0,
+        rank_ids=getattr(args, "_mimo_site_rank_ids", {}).get(encoder_module_name),
         expt_tp=1,
     )
     return [encoder_grid_spec, language_grid_spec]
+
+
+def configure_site_rank_layout(
+    args: argparse.Namespace, site_ids: list[int], encoder_module_name: str
+) -> None:
+    """Assign logical module-grid positions to site-major global ranks.
+
+    Each site contains an integer number of complete encoder/language optimizer-instance
+    pairs. The number of pairs may differ between sites. Within a site, encoder ranks
+    precede language ranks, keeping bridge activation traffic site-local.
+    """
+    world_size = len(site_ids)
+    encoder_size, language_size = validate_hetero_grid_args(args, world_size)
+    if any(type(site) is not int or site < 0 for site in site_ids):
+        raise ValueError("Every MIMO rank must provide a nonnegative --site-id")
+    site_blocks = []
+    for rank, site in enumerate(site_ids):
+        if not site_blocks or site_blocks[-1][0] != site:
+            if any(previous[0] == site for previous in site_blocks):
+                raise ValueError("Each MIMO site must occupy one contiguous global-rank block")
+            site_blocks.append([site, rank, rank + 1])
+        else:
+            site_blocks[-1][2] = rank + 1
+
+    instances = args.num_distributed_optimizer_instances
+    if instances < len(site_blocks):
+        raise ValueError("MIMO needs at least one optimizer instance per site")
+    if args.mimo_llm_dp % instances or (encoder_size and args.mimo_encoder_dp % instances):
+        raise ValueError("MIMO optimizer instances must divide encoder and language DP sizes")
+    language_batch_lanes = get_language_batch_parallel_size(args)
+    if language_batch_lanes % instances:
+        raise ValueError("MIMO optimizer instances must divide language batch lanes")
+
+    encoder_per_instance = encoder_size // instances
+    language_per_instance = language_size // instances
+    pair_size = encoder_per_instance + language_per_instance
+    site_instance_counts = []
+    for site, start, end in site_blocks:
+        count, remainder = divmod(end - start, pair_size)
+        if remainder or count == 0:
+            raise ValueError(
+                f"Site {site} must contain a positive whole number of encoder/language "
+                f"optimizer-instance pairs ({pair_size} ranks per pair)"
+            )
+        site_instance_counts.append(count)
+    if sum(site_instance_counts) != instances:
+        raise ValueError("MIMO site rank counts do not match optimizer-instance count")
+
+    def logical_instance_indices(size, tp, cp, gtp, dp):
+        if size == 0:
+            return []
+        stride = tp * cp * gtp
+        inner_dp = dp // instances
+        return [((index // stride) % dp) // inner_dp for index in range(size)]
+
+    layouts = {
+        encoder_module_name: (
+            encoder_size,
+            logical_instance_indices(
+                encoder_size, args.mimo_encoder_tp, 1, 1, args.mimo_encoder_dp
+            ),
+        ),
+        MIMO_LANGUAGE_MODULE_KEY: (
+            language_size,
+            logical_instance_indices(
+                language_size,
+                args.mimo_llm_tp,
+                args.mimo_llm_cp,
+                resolve_hetero_gtp_degrees(args)[0],
+                args.mimo_llm_dp,
+            ),
+        ),
+    }
+    rank_ids = {}
+    for module_name, (size, instance_for_index) in layouts.items():
+        if size == 0:
+            continue
+        instance_indices = [
+            [index for index, instance in enumerate(instance_for_index) if instance == group]
+            for group in range(instances)
+        ]
+        output = [None] * size
+        next_instance = 0
+        for (_, start, _), count in zip(site_blocks, site_instance_counts):
+            physical_start = start + (count * encoder_per_instance if module_name == MIMO_LANGUAGE_MODULE_KEY else 0)
+            logical_indices = [
+                index
+                for group in range(next_instance, next_instance + count)
+                for index in instance_indices[group]
+            ]
+            for offset, index in enumerate(logical_indices):
+                output[index] = physical_start + offset
+            next_instance += count
+        rank_ids[module_name] = tuple(output)
+
+    args._mimo_site_rank_ids = rank_ids
+    args._mimo_site_ids = tuple(site_ids)
+    args._mimo_site_instance_counts = tuple(site_instance_counts)
 
 
 def resolve_hetero_gtp_degrees(args: argparse.Namespace) -> tuple[int, int]:

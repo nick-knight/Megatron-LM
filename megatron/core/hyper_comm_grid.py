@@ -93,6 +93,8 @@ class HyperCommGrid:
         rank_offset: Starting rank when the grid doesn't span the entire communication world.
             Default 0.
         backend: Backend for creating process group. Default None and will use default backend.
+        rank_ids: Optional ordered global ranks for the grid's logical positions. When omitted,
+            the grid uses a contiguous span beginning at ``rank_offset``.
     """
 
     def __init__(
@@ -101,6 +103,7 @@ class HyperCommGrid:
         dim_names: list[str],
         rank_offset: int = 0,
         backend: Optional[str] = None,
+        rank_ids: Optional[list[int]] = None,
     ) -> None:
         if len(shape) != len(dim_names):
             raise ValueError(f"len(shape) {shape} != len(dim_names) {dim_names}")
@@ -121,7 +124,16 @@ class HyperCommGrid:
         self.size = int(np.prod(shape))
         if rank_offset < 0:
             raise ValueError(f"rank_offset must be non-negative, got {rank_offset}")
-        if self.size > world_size - rank_offset:
+        if rank_ids is not None:
+            if len(rank_ids) != self.size or len(set(rank_ids)) != self.size:
+                raise ValueError("rank_ids must contain exactly one distinct rank per grid position")
+            if any(type(rank) is not int or rank < 0 or rank >= world_size for rank in rank_ids):
+                raise ValueError("rank_ids must be global ranks within the distributed world")
+            self.rank_ids = tuple(rank_ids)
+        else:
+            self.rank_ids = tuple(range(rank_offset, rank_offset + self.size))
+        self._rank_to_index = {rank: index for index, rank in enumerate(self.rank_ids)}
+        if rank_ids is None and self.size > world_size - rank_offset:
             raise RuntimeError(
                 f"Grid shape {shape} is over sized with world size {world_size} and rank "
                 f"offset {self.rank_offset}"
@@ -364,8 +376,7 @@ class HyperCommGrid:
         # Need to reverse order of dim_names to match MCore convention.
         dim_names_reverse = dim_names[::-1]
         shape_dict = {d: s for d, s in zip(dim_names, shape)}
-        size = int(np.prod(shape))
-        rank_tensor = np.arange(self.rank_offset, self.rank_offset + size).reshape(
+        rank_tensor = np.asarray(self.rank_ids).reshape(
             [shape_dict[d] for d in dim_names_reverse]
         )
 
@@ -441,7 +452,11 @@ class HyperCommGrid:
         """Check if the current rank belongs to this grid.
 
         Returns:
-            True if the current rank is within [rank_offset, rank_offset + size).
+            True if the current rank belongs to the grid's rank map.
         """
         rank = dist.get_rank()
-        return bool(self.rank_offset <= rank < self.rank_offset + self.size)
+        return rank in self._rank_to_index
+
+    def logical_rank_index(self, rank: int) -> int:
+        """Return a global rank's coordinate in this grid's logical rank order."""
+        return self._rank_to_index[rank]

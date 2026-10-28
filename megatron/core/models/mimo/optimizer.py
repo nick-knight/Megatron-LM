@@ -421,12 +421,13 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
                     pg_collection is not None
                 ), f"Module '{module_name}' must own a ProcessGroupCollection for optimizer setup"
                 module_config = _optimizer_config_for_module(config, module)
-                assert module.ddp_config.num_distributed_optimizer_instances == 1, (
-                    "MIMO optimizer does not yet support "
-                    "num_distributed_optimizer_instances > 1. "
-                    f"Module '{module_name}' has "
-                    f"{module.ddp_config.num_distributed_optimizer_instances} instances."
-                )
+                if module.ddp_config.num_distributed_optimizer_instances > 1 and not all(
+                    getattr(pg_collection, field, None) is not None
+                    for field in ("intra_dp_cp", "intra_expt_dp", "inter_dist_opt", "intra_dist_opt")
+                ):
+                    raise ValueError(
+                        f"Module '{module_name}' needs site-aware optimizer-instance groups"
+                    )
                 optimizer = get_megatron_optimizer(
                     config=module_config,
                     model_chunks=[module],

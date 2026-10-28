@@ -11,6 +11,7 @@ import pytest
 from examples.mimo.training.args import (
     add_hetero_grid_args,
     build_module_grid_specs,
+    configure_site_rank_layout,
     validate_hetero_grid_args,
 )
 from examples.mimo.utils.hetero import get_language_batch_parallel_size
@@ -80,10 +81,50 @@ def test_parser_uses_mimo_prefixed_destinations():
     }
 
 
-def test_heterogeneous_grid_rejects_unhandled_site_id():
-    args = _layout_8gpu_20l(site_id=0)
-    with pytest.raises(ValueError, match="does not yet support --site-id"):
-        validate_hetero_grid_args(args, WORLD_SIZE_8)
+def test_site_major_layout_maps_both_modules_into_each_site():
+    args = _layout_8gpu_20l(
+        site_id=0, num_distributed_optimizer_instances=2, mimo_llm_ep=1, num_experts=0
+    )
+    with pytest.raises(ValueError, match="configure_site_rank_layout"):
+        build_module_grid_specs(args, WORLD_SIZE_8, "images")
+
+    configure_site_rank_layout(args, [0] * 4 + [1] * 4, "images")
+    encoder, language = build_module_grid_specs(args, WORLD_SIZE_8, "images")
+    assert encoder.rank_ids == (0, 1, 4, 5)
+    assert language.rank_ids == (2, 3, 6, 7)
+    assert args._mimo_site_instance_counts == (1, 1)
+
+
+def test_site_major_layout_allows_nonuniform_instance_counts():
+    args = _layout_8gpu_20l(
+        site_id=0,
+        num_distributed_optimizer_instances=4,
+        mimo_encoder_dp=4,
+        mimo_llm_dp=4,
+        mimo_llm_ep=1,
+        num_experts=0,
+    )
+    configure_site_rank_layout(args, [0] * 4 + [1] * 8 + [2] * 4, "images")
+    encoder, language = build_module_grid_specs(args, 16, "images")
+    assert encoder.rank_ids == (0, 1, 4, 5, 6, 7, 12, 13)
+    assert language.rank_ids == (2, 3, 8, 9, 10, 11, 14, 15)
+    assert args._mimo_site_instance_counts == (1, 2, 1)
+
+
+@pytest.mark.parametrize(
+    "site_ids,match",
+    [
+        ([0] * 3 + [1] * 5, "whole number"),
+        ([0] * 2 + [1] * 4 + [0] * 2, "contiguous"),
+        ([0] * 4 + [None] * 4, "nonnegative"),
+    ],
+)
+def test_site_major_layout_rejects_invalid_placement(site_ids, match):
+    args = _layout_8gpu_20l(
+        site_id=0, num_distributed_optimizer_instances=2, mimo_llm_ep=1, num_experts=0
+    )
+    with pytest.raises(ValueError, match=match):
+        configure_site_rank_layout(args, site_ids, "images")
 
 
 @pytest.mark.parametrize("flag", OLD_GRID_FLAGS)

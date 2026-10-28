@@ -267,7 +267,9 @@ class MultiModulePipelineCommunicator:
 
     def is_current_rank_in_grid(self, grid: HyperCommGrid) -> bool:
         """Check if the current rank is in the grid."""
-        return grid.rank_offset <= self.current_rank < grid.rank_offset + grid.size
+        return self.current_rank in getattr(
+            grid, "rank_ids", range(grid.rank_offset, grid.rank_offset + grid.size)
+        )
 
     @property
     def total_stages(self) -> int:
