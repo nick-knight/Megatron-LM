@@ -53,6 +53,95 @@ from tests.unit_tests.test_utilities import Utils
 pytestmark = pytest.mark.usefixtures("run_config")
 
 
+@pytest.mark.parametrize("mismatch", ["none", "sites", "within_site"])
+def test_site_resume_agreement(mismatch):
+    from megatron.training import checkpointing
+
+    Utils.initialize_distributed()
+    if Utils.world_size < 4 or Utils.world_size % 2:
+        pytest.skip("Requires two equal checkpoint domains")
+    group_size = Utils.world_size // 2
+    groups = [
+        dist.new_group(ranks=list(range(start, start + group_size)))
+        for start in (0, group_size)
+    ]
+    group = groups[Utils.rank // group_size]
+    iteration = 3
+    if mismatch == "sites" and Utils.rank >= group_size:
+        iteration = 7
+    elif mismatch == "within_site" and Utils.rank == 1:
+        iteration = 7
+
+    if mismatch == "none":
+        checkpointing._validate_site_resume_agreement(group, "selection", (iteration, False))
+    else:
+        with pytest.raises(RuntimeError, match="use --ckpt-step"):
+            checkpointing._validate_site_resume_agreement(
+                group, "selection", (iteration, False)
+            )
+
+
+def test_site_load_detects_format_mismatch_before_loading(create_ckpt_load_args, monkeypatch):
+    from megatron.training import checkpointing
+
+    Utils.initialize_distributed()
+    if Utils.world_size < 4 or Utils.world_size % 2:
+        pytest.skip("Requires two equal checkpoint domains")
+    group_size = Utils.world_size // 2
+    groups = [
+        dist.new_group(ranks=list(range(start, start + group_size)))
+        for start in (0, group_size)
+    ]
+    group = groups[Utils.rank // group_size]
+    args = create_ckpt_load_args
+    args.load = "unused"
+    args.ckpt_format = "torch_dist"
+    args.auto_detect_ckpt_format = True
+    monkeypatch.setattr(checkpointing, "get_args", lambda: args)
+    monkeypatch.setattr(
+        checkpointing,
+        "_default_site_checkpoint_groups",
+        lambda *a, **kw: (group, None),
+    )
+    ckpt_type = CheckpointType.GLOBAL if Utils.rank < group_size else CheckpointType.LEGACY
+    monkeypatch.setattr(
+        checkpointing,
+        "_load_base_checkpoint",
+        mock.Mock(return_value=({}, "unused", False, ckpt_type)),
+    )
+
+    with pytest.raises(RuntimeError, match="same checkpoint format and iteration"):
+        load_checkpoint([], None, None)
+
+
+@pytest.mark.parametrize("requested_step", [0, 100])
+def test_ckpt_step_overrides_newer_nonpersistent_checkpoint(monkeypatch, requested_step):
+    from megatron.training import checkpointing
+
+    args = SimpleNamespace(
+        non_persistent_global_ckpt_dir=None,
+        non_persistent_ckpt_type="global",
+        ckpt_step=requested_step,
+        exit_on_missing_checkpoint=True,
+    )
+    monkeypatch.setattr(checkpointing, "_get_non_persistent_iteration", lambda *a, **kw: 101)
+    monkeypatch.setattr(checkpointing, "file_exists", lambda *a: False)
+    monkeypatch.setattr(checkpointing.maybe_msc.os.path, "isfile", lambda *a: True)
+    monkeypatch.setattr(checkpointing, "read_metadata", lambda *a, **kw: (100, False))
+    monkeypatch.setattr(checkpointing, "_get_checkpoint_format", lambda *a: "torch_dist")
+    persistent_load = mock.Mock(return_value=({}, "checkpoint", False, CheckpointType.GLOBAL))
+    nonpersistent_load = mock.Mock()
+    monkeypatch.setattr(checkpointing, "_load_global_dist_base_checkpoint", persistent_load)
+    monkeypatch.setattr(checkpointing, "_load_non_persistent_base_checkpoint", nonpersistent_load)
+    loaded_iteration = mock.Mock()
+    monkeypatch.setattr(checkpointing, "set_loaded_iteration", loaded_iteration)
+
+    checkpointing._load_base_checkpoint("checkpoint_root", args, rank0=True)
+    persistent_load.assert_called_once()
+    nonpersistent_load.assert_not_called()
+    loaded_iteration.assert_called_once_with(requested_step)
+
+
 @pytest.mark.parametrize("ckpt_args", [None, SimpleNamespace()])
 def test_model_only_checkpoint_does_not_trigger_gpt_hybrid_interop(ckpt_args):
     """Missing checkpoint args do not identify a model-only checkpoint as GPT."""

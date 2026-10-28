@@ -312,7 +312,7 @@ def get_load_checkpoint_path_by_args(args, load_arg='load'):
             iteration, release = read_metadata(tracker_filename)
 
     # Allow user to specify the loaded iteration.
-    if getattr(args, 'ckpt_step', None):
+    if getattr(args, 'ckpt_step', None) is not None:
         iteration = args.ckpt_step
 
     return get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
@@ -675,6 +675,35 @@ def _default_site_checkpoint_groups(args, checkpoint_group, parallelization_grou
         else:
             raise ValueError(f'Invalid checkpoint parallelization group: {kind}')
     return site_group, parallelization_group
+
+
+def _validate_site_resume_agreement(checkpoint_group, phase, state):
+    """Check that independently stored site checkpoints describe one training step.
+
+    Only small progress metadata crosses sites. Checkpoint files and DCP planning
+    remain scoped to ``checkpoint_group``.
+    """
+    if checkpoint_group is None or not torch.distributed.is_initialized():
+        return
+    if torch.distributed.get_world_size(group=checkpoint_group) == torch.distributed.get_world_size():
+        return
+
+    domain_rank = min(torch.distributed.get_process_group_ranks(checkpoint_group))
+    reports = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(reports, (domain_rank, state))
+    states_by_domain = {}
+    for rank, (domain, reported_state) in enumerate(reports):
+        states_by_domain.setdefault(domain, {})[rank] = reported_state
+    if len({reported_state for _, reported_state in reports}) > 1:
+        summary = ", ".join(
+            f"domain {domain}: {sorted(set(values.values()), key=str)}"
+            for domain, values in sorted(states_by_domain.items())
+        )
+        raise RuntimeError(
+            f"Site checkpoint {phase} differs across ranks ({summary}). "
+            "Load the same checkpoint format and iteration on every site; "
+            "use --ckpt-step to select a common iteration explicitly."
+        )
 
 
 def save_checkpoint(
@@ -2284,15 +2313,21 @@ def _load_base_checkpoint(
                 )
 
     # Allow user to specify the loaded iteration.
-    if getattr(args, 'ckpt_step', None):
-        iteration = args.ckpt_step
+    requested_step = getattr(args, 'ckpt_step', None)
+    if requested_step is not None:
+        iteration = requested_step
+
+    use_non_persistent = non_persistent_iteration != -1 and (
+        (requested_step is None and non_persistent_iteration >= iteration)
+        or requested_step == non_persistent_iteration
+    )
 
     # Record the iteration loaded (stored separately from args to avoid
     # polluting checkpoints, since args is saved in checkpoints).
-    set_loaded_iteration(iteration)
+    set_loaded_iteration(non_persistent_iteration if use_non_persistent else iteration)
 
     if non_persistent_iteration != -1:  # there is a non-persistent checkpoint
-        if non_persistent_iteration >= iteration:
+        if use_non_persistent:
             return _load_non_persistent_base_checkpoint(
                 non_persistent_global_dir,
                 args,
@@ -2307,7 +2342,7 @@ def _load_base_checkpoint(
                 checkpoint_parallelization_group=checkpoint_parallelization_group,
                 gtp_pad_for_alignment=gtp_pad_for_alignment,
             )
-        else:
+        elif requested_step is None:
             print_rank_0('WARNING: non-persistent checkpoints are older than persistent checkpoint')
 
     # Otherwise we are dealing with global checkpoints
@@ -2866,6 +2901,22 @@ def load_checkpoint(
         else:
             raise NotImplementedError(f'checkpoint format {ckpt_format} not supported')
 
+    # Every rank must enter this preflight before any rank rejects an on-disk
+    # format. Otherwise a site that detected an unsupported format can leave
+    # other sites waiting in a later world collective.
+    selection = (ckpt_format,)
+    if restore_training_state and not args.finetune:
+        selected_iteration = (
+            state_dict.get('iteration', state_dict.get('total_iters'))
+            if state_dict is not None
+            else None
+        )
+        selection += (
+            selected_iteration,
+            bool(release),
+            bool(loading_pretrained_checkpoint),
+        )
+    _validate_site_resume_agreement(checkpoint_group, 'selection', selection)
     if checkpoint_group is not None and ckpt_format not in ('torch_dist', None):
         raise ValueError('checkpoint_group is supported only for torch_dist checkpoints')
 
@@ -3660,6 +3711,15 @@ def load_checkpoint(
 
     # Some utilities want to load a checkpoint without distributed being initialized
     if torch.distributed.is_initialized():
+        if restore_training_state and not args.finetune:
+            progress = (
+                iteration,
+                current_train_state.consumed_train_samples if current_train_state else None,
+                current_train_state.skipped_train_samples if current_train_state else None,
+                current_train_state.consumed_valid_samples if current_train_state else None,
+                num_floating_point_operations_so_far,
+            )
+            _validate_site_resume_agreement(checkpoint_group, 'restored progress', progress)
         torch.distributed.barrier(group=checkpoint_group)
 
     _tp_r = get_pg_rank(tp_group) if tp_group is not None else mpu.get_tensor_model_parallel_rank()
