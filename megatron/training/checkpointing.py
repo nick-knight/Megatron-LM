@@ -1029,7 +1029,12 @@ def save_checkpoint(
                 )
             # [ModelOpt]: save sharded modelopt_state
             if has_nvidia_modelopt:
-                save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))
+                save_sharded_modelopt_state(
+                    model,
+                    checkpoint_name,
+                    (args.ckpt_format, 1),
+                    checkpoint_group=checkpoint_group,
+                )
         elif ckpt_type == CheckpointType.GLOBAL and ckpt_format in ['torch_dcp', 'fsdp_dtensor']:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 # TODO Handle non-empty directories (e.g., after a crash during saving).

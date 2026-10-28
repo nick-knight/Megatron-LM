@@ -123,6 +123,26 @@ class TestSaveShardedModeloptState:
         mock_save.assert_called_once()
         assert mock_save.call_args.args[1] == f"{tmp_path}/modelopt_state"
 
+    def test_site_group_owns_auxiliary_checkpoint(self, tmp_path):
+        group = mock.sentinel.site_group
+        with (
+            mock.patch.object(mto.ModeloptStateManager, "is_converted", return_value=True),
+            mock.patch.object(mto, "modelopt_state", return_value={"modelopt_state_dict": []}),
+            mock.patch.object(mdist, "is_master", return_value=False) as global_master,
+            mock.patch.object(torch.distributed, "get_rank", return_value=0) as group_rank,
+            mock.patch("megatron.core.post_training.modelopt.checkpointing.save") as mock_save,
+        ):
+            save_sharded_modelopt_state(
+                [mock.MagicMock()], str(tmp_path), checkpoint_group=group
+            )
+        assert (tmp_path / "modelopt_state").is_dir()
+        group_rank.assert_called_once_with(group=group)
+        global_master.assert_not_called()
+        assert mock_save.call_args.kwargs == {
+            "process_group": group,
+            "preferred_writer_ranks": (),
+        }
+
 
 class TestRestoreShardedModeloptState:
     def test_multiple_models_raises(self):
@@ -179,3 +199,17 @@ class TestLoadExtraStateFromShardedCheckpoint:
         loaded_dict = model.load_state_dict.call_args.args[0]
         assert "layer._extra_state" in loaded_dict
         assert f"{prefix}layer._extra_state" not in loaded_dict
+
+    def test_site_group_scopes_extra_state_load(self, tmp_path):
+        model = mock.MagicMock()
+        model.sharded_state_dict.return_value = {"layer._extra_state": mock.MagicMock()}
+        group = mock.sentinel.site_group
+        with mock.patch(
+            "megatron.core.post_training.modelopt.checkpointing.load",
+            return_value={"layer._extra_state": torch.tensor([1.0])},
+        ) as mock_load:
+            _load_extra_state_from_sharded_checkpoint(
+                model, str(tmp_path), "", checkpoint_group=group
+            )
+        assert mock_load.call_args.kwargs["process_group"] is group
+        assert mock_load.call_args.kwargs["preferred_reader_ranks"] == ()

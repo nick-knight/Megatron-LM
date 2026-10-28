@@ -15,7 +15,7 @@ from modelopt.torch.opt.plugins.mcore_dist_checkpointing import (
     _load_extra_state_from_sharded_checkpoint,
 )
 
-from megatron.core import dist_checkpointing
+from megatron.core import dist_checkpointing, mpu
 from megatron.core.post_training.modelopt.checkpointing import restore_sharded_modelopt_state
 from megatron.core.utils import unwrap_model
 from megatron.training import get_args
@@ -65,7 +65,9 @@ def has_modelopt_state(checkpoint_path: str) -> bool:
             return _has_nontrivial_modelopt_state(modelopt_state)
         else:
             # Sharded
-            load_dir = get_sharded_load_dir(checkpoint_path)
+            load_dir = get_sharded_load_dir(
+                checkpoint_path, checkpoint_group=mpu.get_site_group(check_initialized=False)
+            )
             if load_dir is None:
                 return False
             modelopt_checkpoint_name = load_dir / "modelopt_state"
@@ -78,13 +80,13 @@ def has_modelopt_state(checkpoint_path: str) -> bool:
         return False
 
 
-def get_sharded_load_dir(load_dir: str) -> Optional[Path]:
+def get_sharded_load_dir(load_dir: str, checkpoint_group=None) -> Optional[Path]:
     """Helper to retrieve the sharded load directory from a MLM checkpoint tracker file."""
     if not checkpoint_exists(load_dir):
         return None
 
     tracker_filename = get_checkpoint_tracker_filename(load_dir)
-    iteration, release = read_metadata(tracker_filename)
+    iteration, release = read_metadata(tracker_filename, checkpoint_group=checkpoint_group)
     sharded_load_dir = Path(get_checkpoint_name(load_dir, iteration, release, return_base_dir=True))
 
     if not sharded_load_dir.exists():
@@ -123,11 +125,14 @@ def load_modelopt_state(model: nn.Module, load_dir: Optional[str] = None) -> Non
             mto.restore_from_modelopt_state(model, modelopt_state)
     else:
         # Sharded
-        sharded_load_dir = get_sharded_load_dir(load_dir)
+        checkpoint_group = mpu.get_site_group(check_initialized=False)
+        sharded_load_dir = get_sharded_load_dir(load_dir, checkpoint_group=checkpoint_group)
         if sharded_load_dir is None:
             print_rank_0("No sharded checkpoint found. Skipping loading modelopt_state.")
             return
-        restore_sharded_modelopt_state([model], sharded_load_dir)
+        restore_sharded_modelopt_state(
+            [model], sharded_load_dir, checkpoint_group=checkpoint_group
+        )
 
 
 def load_kd_teacher_checkpoint(model) -> None:

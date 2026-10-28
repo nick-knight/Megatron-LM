@@ -69,6 +69,7 @@ def save_sharded_modelopt_state(
     checkpoint_name: str | Path,
     sharded_strategy: tuple[str, int] | None = None,
     prefix: str = "",
+    checkpoint_group: torch.distributed.ProcessGroup | None = None,
 ) -> None:
     """Save modelopt_state in the sharded state_dict format.
 
@@ -77,6 +78,7 @@ def save_sharded_modelopt_state(
         checkpoint_name: the checkpoint folder path
         sharded_strategy: configures sharded tensors saving behavior and backend
         prefix: the prefix to add to the modelopt_state keys ("model." for NeMo)
+        checkpoint_group: ranks that own this checkpoint directory
     """
     import modelopt.torch.opt as mto
     import modelopt.torch.utils.distributed as dist
@@ -86,15 +88,28 @@ def save_sharded_modelopt_state(
     if len(model) > 1:
         raise ValueError("sharded_modelopt_state does not support virtual pipeline parallel!")
     modelopt_checkpoint_name = f"{checkpoint_name}/modelopt_state"
-    if dist.is_master():
+    if (
+        torch.distributed.get_rank(group=checkpoint_group) == 0
+        if checkpoint_group is not None
+        else dist.is_master()
+    ):
         os.makedirs(modelopt_checkpoint_name, exist_ok=True)
     modelopt_state = copy.deepcopy(mto.modelopt_state(model[0]))
     remove_per_module_state(modelopt_state)
-    save(modelopt_state, modelopt_checkpoint_name, sharded_strategy)
+    save(
+        modelopt_state,
+        modelopt_checkpoint_name,
+        sharded_strategy,
+        process_group=checkpoint_group,
+        preferred_writer_ranks=() if checkpoint_group is not None else None,
+    )
 
 
 def _load_extra_state_from_sharded_checkpoint(
-    model: torch.nn.Module, checkpoint_name: str | Path, prefix: str
+    model: torch.nn.Module,
+    checkpoint_name: str | Path,
+    prefix: str,
+    checkpoint_group: torch.distributed.ProcessGroup | None = None,
 ) -> None:
     """Load extra state from sharded checkpoint.
 
@@ -105,6 +120,7 @@ def _load_extra_state_from_sharded_checkpoint(
         model: the model to load extra state into
         checkpoint_name: the checkpoint folder path
         prefix: the prefix to add to the modelopt_state keys
+        checkpoint_group: ranks that collectively load this checkpoint
     """
     sharded_state_dict = model.sharded_state_dict(prefix=prefix)
     extra_sharded_state_dict = {k: v for k, v in sharded_state_dict.items() if "_extra_state" in k}
@@ -113,6 +129,8 @@ def _load_extra_state_from_sharded_checkpoint(
         checkpoint_name,
         TorchDistLoadShardedStrategy(),
         strict=StrictHandling.LOG_UNEXPECTED,
+        process_group=checkpoint_group,
+        preferred_reader_ranks=() if checkpoint_group is not None else None,
     )
     extra_state_dict_no_prefix = {}
 
@@ -123,7 +141,10 @@ def _load_extra_state_from_sharded_checkpoint(
 
 
 def restore_sharded_modelopt_state(
-    model: list[torch.nn.Module], checkpoint_name: str | Path, prefix: str = ""
+    model: list[torch.nn.Module],
+    checkpoint_name: str | Path,
+    prefix: str = "",
+    checkpoint_group: torch.distributed.ProcessGroup | None = None,
 ) -> None:
     """Restore modelopt_state from the sharded state_dict format.
 
@@ -131,6 +152,7 @@ def restore_sharded_modelopt_state(
         model: the model to restore the modelopt optimization
         checkpoint_name: the checkpoint folder path
         prefix: the prefix to add to the modelopt_state keys ("model." for NeMo)
+        checkpoint_group: ranks that collectively load this checkpoint
     """
     import modelopt
     import modelopt.torch.opt as mto
@@ -157,4 +179,6 @@ def restore_sharded_modelopt_state(
 
     model[0] = mto.restore_from_modelopt_state(model[0], common_modelopt_state)
 
-    _load_extra_state_from_sharded_checkpoint(model[0], checkpoint_name, prefix)
+    _load_extra_state_from_sharded_checkpoint(
+        model[0], checkpoint_name, prefix, checkpoint_group=checkpoint_group
+    )
