@@ -247,6 +247,8 @@ def test_builder_seeds_per_role_meta_builds_and_sets_contract(mocker):
     # Load-bearing contract for Increments 2/4: own module PGC and role prefix on the model.
     assert model.pg_collection is groups
     assert model.rng_state_key_prefix == "language."
+    assert model.checkpoint_group is topology.site_group
+    assert model.checkpoint_parallelization_group is topology.site_group
 
 
 def test_builder_encoder_role_sets_encoder_contract(mocker):

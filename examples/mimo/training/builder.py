@@ -184,6 +184,10 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         configure_grad_sync(args, mimo_model, topology)
         mimo_model.pg_collection = module_pg
         mimo_model.rng_state_key_prefix = rng_state_key_prefix
+        # Heterogeneous MIMO owns its process groups rather than global parallel_state.
+        # Each site contains a complete encoder/language checkpoint domain.
+        mimo_model.checkpoint_group = topology.site_group
+        mimo_model.checkpoint_parallelization_group = topology.site_group
 
         model_list = compose_hooks(self._model_config.post_wrap_hooks)([mimo_model])
         if len(model_list) != 1:

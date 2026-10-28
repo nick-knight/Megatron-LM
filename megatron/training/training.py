@@ -3049,6 +3049,10 @@ def setup_model_and_optimizer(
                 dp_group=ckpt_pgc.dp if ckpt_pgc is not None else None,
                 expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
                 rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
+                checkpoint_group=getattr(unwrapped_model[0], "checkpoint_group", None),
+                checkpoint_parallelization_group=getattr(
+                    unwrapped_model[0], "checkpoint_parallelization_group", None
+                ),
             )
             train_state.resume_iteration = train_state.iteration
             train_state.resume_num_floating_point_operations = (
@@ -4271,6 +4275,10 @@ def save_checkpoint_and_time(
                 rng_state_key_prefix=rng_state_key_prefix,
                 cp_group=cp_group,
                 on_saved=on_saved,
+                checkpoint_group=getattr(unwrap_model(model)[0], "checkpoint_group", None),
+                checkpoint_parallelization_group=getattr(
+                    unwrap_model(model)[0], "checkpoint_parallelization_group", None
+                ),
             )
 
             # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
