@@ -18,6 +18,11 @@ logger = logging.getLogger(__name__)
 MIMO_LANGUAGE_MODULE_KEY = "language"
 
 
+def _grid_rank_ids(grid) -> set[int]:
+    """Return membership, including legacy grid-shaped test doubles."""
+    return set(getattr(grid, "rank_ids", range(grid.rank_offset, grid.rank_offset + grid.size)))
+
+
 class ModuleLayout(Enum):
     """Pipeline mode for MIMO multi-module parallelism.
 
@@ -86,7 +91,7 @@ class RankRole:
     def _all_grids_colocated(module_to_grid_map: Dict[str, 'HyperCommGrid']) -> bool:
         grids = list(module_to_grid_map.values())
         first = grids[0]
-        return all(g.rank_offset == first.rank_offset and g.size == first.size for g in grids[1:])
+        return all(_grid_rank_ids(g) == _grid_rank_ids(first) for g in grids[1:])
 
     @classmethod
     def _colocated(cls, modality_module_names: List[str]) -> 'RankRole':
@@ -113,7 +118,7 @@ class RankRole:
         modules = {}
 
         for module_name, grid in module_to_grid_map.items():
-            if not (grid.rank_offset <= current_rank < grid.rank_offset + grid.size):
+            if current_rank not in _grid_rank_ids(grid):
                 continue
 
             if "pp" not in grid.dim_names:

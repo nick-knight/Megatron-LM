@@ -14,11 +14,14 @@ suppress_duplicate_logs_off_rank0()
 import argparse
 from functools import partial
 
+import torch.distributed as dist
+
 from examples.mimo.model_providers import resolve_provider
 from examples.mimo.model_providers.nemotron_moe_vlm import add_model_provider_args
 from examples.mimo.training.args import (
     add_hetero_grid_args,
     build_module_grid_specs,
+    configure_site_rank_layout,
     validate_hetero_grid_args,
 )
 from examples.mimo.training.builder import MimoBuildConfig
@@ -101,8 +104,17 @@ def main() -> None:
     # The grid/rank-layout args model a single encoder region; the builder itself is
     # generic over any number of encoder grids in the topology.
     encoder_name = provider.encoder_module_names[0] if provider.encoder_module_names else None
+    if args.site_id is not None:
+        site_ids = [None] * dist.get_world_size()
+        dist.all_gather_object(site_ids, args.site_id)
+        configure_site_rank_layout(args, site_ids, encoder_name)
     specs = build_module_grid_specs(args, args.world_size, encoder_name)
-    topology = create_topology(specs, cfg.dist.high_priority_stream_groups)
+    topology = create_topology(
+        specs,
+        cfg.dist.high_priority_stream_groups,
+        site_ids=getattr(args, "_mimo_site_ids", None),
+        num_optimizer_instances=args.num_distributed_optimizer_instances,
+    )
 
     communicator = provider.build_communicator(args, topology)
 

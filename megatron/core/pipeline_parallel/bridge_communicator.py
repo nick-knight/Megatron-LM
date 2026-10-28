@@ -317,7 +317,7 @@ class BridgeCommunicator:
             sample_rank = rank_list[0]
             # Calculate rank coordinates
             rank_coords = []
-            temp_rank = sample_rank - grid.rank_offset
+            temp_rank = grid.logical_rank_index(sample_rank)
 
             # Extract coordinates in the original dimension order
             for dim_size in grid.shape:
@@ -334,7 +334,7 @@ class BridgeCommunicator:
 
     def is_current_rank_in_grid(self, grid: HyperCommGrid) -> bool:
         """Check if the current rank is in the grid."""
-        return grid.rank_offset <= self.current_rank < (grid.rank_offset + grid.size)
+        return grid.is_current_rank_in_grid()
 
     def build_comm_map(self, src_tp_leaders: List[int], dest_tp_leaders: List[int]):
         """Get src/dest tp leaders and populate comm_map for each rank.
@@ -353,12 +353,8 @@ class BridgeCommunicator:
                 f"({dest_count}) must be evenly divisible. One must be a multiple of the other."
             )
         # Get all ranks in source and destination grids
-        src_all_ranks = list(
-            range(self.src_grid.rank_offset, self.src_grid.rank_offset + self.src_grid.size)
-        )
-        dest_all_ranks = list(
-            range(self.dest_grid.rank_offset, self.dest_grid.rank_offset + self.dest_grid.size)
-        )
+        src_all_ranks = list(self.src_grid.rank_ids)
+        dest_all_ranks = list(self.dest_grid.rank_ids)
 
         all_ranks = src_all_ranks + dest_all_ranks
 

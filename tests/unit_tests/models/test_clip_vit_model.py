@@ -2,6 +2,8 @@
 import pytest
 import torch
 
+from megatron.core import parallel_state
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.multimodal.utils import patchify_image, unpatchify_image
 from megatron.core.models.vision.clip_vit_model import (
@@ -59,6 +61,60 @@ class TestCLIPViTModel:
         torch.save(self.model.state_dict(), path)
 
         self.model.load_state_dict(torch.load(path))
+
+
+def test_vision_encoder_grad_sync_with_site_local_optimizer_instances():
+    """Vision weights follow the same intra- and inter-instance DP path as language weights."""
+    if Utils.world_size != 8:
+        pytest.skip("Test requires eight ranks")
+
+    try:
+        Utils.initialize_model_parallel(num_distributed_optimizer_instances=2)
+        parallel_state.initialize_site_parallel(
+            Utils.rank // 4, require_complete_optimizer_instances=True
+        )
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        vision = CLIPViTModel(
+            config,
+            get_gpt_layer_with_transformer_engine_spec(),
+            img_h=28,
+            img_w=28,
+            patch_dim=14,
+        ).cuda()
+        model = DistributedDataParallel(
+            config,
+            DistributedDataParallelConfig(
+                use_distributed_optimizer=True,
+                num_distributed_optimizer_instances=2,
+            ),
+            vision,
+        )
+        images = torch.ones(1, 3, 28, 28, device="cuda") * (Utils.rank + 1)
+        model(images).float().square().mean().backward()
+        model.finish_grad_sync()
+
+        inner_group = parallel_state.get_data_parallel_group(
+            with_context_parallel=True, with_gtp_remat=False, partial_data_parallel=True
+        )
+        outer_group = parallel_state.get_inter_distributed_optimizer_instance_group()
+        for buffer in model.buffers:
+            shard_size = buffer.grad_data.numel() // inner_group.size()
+            start = inner_group.rank() * shard_size
+            local_shard = buffer.grad_data[start : start + shard_size]
+            assert torch.isfinite(local_shard).all()
+            replicas = [torch.empty_like(local_shard) for _ in range(outer_group.size())]
+            torch.distributed.all_gather(replicas, local_shard, group=outer_group)
+            torch.testing.assert_close(replicas[0], replicas[1])
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.internal
