@@ -53,6 +53,39 @@ from tests.unit_tests.test_utilities import Utils
 pytestmark = pytest.mark.usefixtures("run_config")
 
 
+@pytest.mark.parametrize("ckpt_format", ["torch", "torch_dcp", "fsdp_dtensor"])
+@pytest.mark.parametrize("loading", [False, True])
+def test_site_checkpoint_rejects_unsupported_format(monkeypatch, ckpt_format, loading):
+    from megatron.training import checkpointing
+
+    monkeypatch.setattr(checkpointing.mpu, "get_site_group", lambda **_: object())
+    args = SimpleNamespace(ckpt_format=ckpt_format, auto_detect_ckpt_format=True)
+    with pytest.raises(ValueError, match="--site-id checkpointing requires --ckpt-format torch_dist"):
+        checkpointing._default_site_checkpoint_groups(args, None, None, loading=loading)
+
+
+def test_site_checkpoint_selects_local_parallelization_group(monkeypatch):
+    from megatron.training import checkpointing
+
+    site_group, dp_group, expert_group = object(), object(), object()
+    monkeypatch.setattr(checkpointing.mpu, "get_site_group", lambda **_: site_group)
+    monkeypatch.setattr(checkpointing.mpu, "get_site_data_parallel_group", lambda **_: dp_group)
+    monkeypatch.setattr(checkpointing.mpu, "get_site_expert_data_parallel_group", lambda: expert_group)
+    args = SimpleNamespace(
+        ckpt_format="torch_dist",
+        ckpt_fully_parallel_save_process_group="dp",
+        ckpt_fully_parallel_load_process_group="ep_dp",
+    )
+    assert checkpointing._default_site_checkpoint_groups(args, None, None, loading=False) == (
+        site_group,
+        dp_group,
+    )
+    assert checkpointing._default_site_checkpoint_groups(args, None, None, loading=True) == (
+        site_group,
+        expert_group,
+    )
+
+
 @pytest.mark.parametrize("ckpt_args", [None, SimpleNamespace()])
 def test_model_only_checkpoint_does_not_trigger_gpt_hybrid_interop(ckpt_args):
     """Missing checkpoint args do not identify a model-only checkpoint as GPT."""
