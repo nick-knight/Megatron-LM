@@ -761,6 +761,62 @@ class _ParamAndGradBucketGroup:
         else:
             communication_group = self.data_parallel_group
 
+        if (
+            self.ddp_config.use_distributed_optimizer
+            and self.ddp_config.num_distributed_optimizer_instances > 1
+            and self.ddp_config.reduce_scatter_with_fp32_accumulation
+        ):
+            assert reduce_op == torch.distributed.ReduceOp.SUM
+            assert self.inter_distributed_optimizer_instance_group is not None
+            if force_all_reduce:
+                # Saving full weight gradients bypasses reduce-scatter. Reduce the whole
+                # buffer in FP32 on both axes so every rank receives the complete gradient.
+                with stream_context:
+                    for bucket in self.buckets:
+                        fp32_grad_data = bucket.grad_data.float()
+                        torch.distributed.all_reduce(
+                            fp32_grad_data, op=reduce_op, group=communication_group, async_op=False
+                        )
+                        torch.distributed.all_reduce(
+                            fp32_grad_data,
+                            op=reduce_op,
+                            group=self.inter_distributed_optimizer_instance_group,
+                            async_op=False,
+                        )
+                        bucket.grad_data.copy_(fp32_grad_data)
+                self.grad_reduce_handle = None
+                return
+
+            # The reduce-scatter moves lower-precision values but accumulates into an FP32 shard.
+            # Keep each shard in FP32 through the inter-instance all-reduce; writing it into
+            # grad_data first would round each instance's partial sum before the final sum.
+            with stream_context:
+                for idx, bucket in enumerate(self.buckets):
+                    if self.cached_grad_buffer_shard_list[idx] is None:
+                        self.cached_grad_buffer_shard_list[idx] = shard_buffer(
+                            bucket.grad_data, self.intra_distributed_optimizer_instance_size
+                        )
+                    local_data_view = self.cached_grad_buffer_shard_list[idx][
+                        self.intra_distributed_optimizer_instance_rank
+                    ]
+                    fp32_shard = torch.empty_like(local_data_view, dtype=torch.float32)
+                    reduce_scatter_with_fp32_accumulation(
+                        fp32_shard,
+                        bucket.grad_data,
+                        op=reduce_op,
+                        group=communication_group,
+                        async_op=False,
+                    )
+                    torch.distributed.all_reduce(
+                        fp32_shard,
+                        op=reduce_op,
+                        group=self.inter_distributed_optimizer_instance_group,
+                        async_op=False,
+                    )
+                    local_data_view.copy_(fp32_shard)
+            self.grad_reduce_handle = None
+            return
+
         # Coalesce communication kernels across buckets in the bucket group.
         grad_reduce_handle = None
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:

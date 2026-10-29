@@ -377,8 +377,18 @@ def test_grad_sync(
 
 
 @pytest.mark.parametrize("overlap_grad_reduce", [False, True])
-def test_low_precision_grad_sync_with_multiple_optimizer_instances(overlap_grad_reduce: bool):
-    """A local BF16 all-to-all plus an inter-instance all-reduce yields the DP mean."""
+@pytest.mark.parametrize("force_all_reduce", [False, True])
+@pytest.mark.parametrize("bucket_size", [None, 512])
+@pytest.mark.parametrize(
+    "rank_values", [tuple(range(1, 9)), (8.0, 1 / 32, 0.0, 0.0, 8.0, 1 / 16, 0.0, 0.0)]
+)
+def test_low_precision_grad_sync_with_multiple_optimizer_instances(
+    overlap_grad_reduce: bool,
+    force_all_reduce: bool,
+    bucket_size: Optional[int],
+    rank_values: tuple,
+):
+    """Keep BF16 gradients in FP32 through both optimizer-instance reductions."""
     if Utils.world_size != 8:
         pytest.skip("Requires eight ranks")
 
@@ -390,7 +400,7 @@ def test_low_precision_grad_sync_with_multiple_optimizer_instances(overlap_grad_
             num_layers=2,
             bias=True,
             shared_embedding=False,
-            bucket_size=None,
+            bucket_size=bucket_size,
             use_distributed_optimizer=True,
             overlap_grad_reduce=overlap_grad_reduce,
             average_in_collective=False,
@@ -399,18 +409,43 @@ def test_low_precision_grad_sync_with_multiple_optimizer_instances(overlap_grad_
             reduce_scatter_with_fp32_accumulation=True,
         )
         assert buffer.grad_data.dtype == torch.bfloat16
-        assert len(bucket_groups) == 1
-        buffer.grad_data.fill_(Utils.rank + 1)
-        model.finish_grad_sync()
+        if bucket_size is None:
+            assert len(bucket_groups) == 1
+        elif overlap_grad_reduce:
+            assert len(bucket_groups) > 1
+        buffer.grad_data.fill_(rank_values[Utils.rank])
 
+        inter_group = parallel_state.get_inter_distributed_optimizer_instance_group()
+        original_all_reduce = torch.distributed.all_reduce
+        inter_dtypes = []
+
+        def record_inter_dtype(tensor, *args, **kwargs):
+            if kwargs.get("group") is inter_group:
+                inter_dtypes.append(tensor.dtype)
+            return original_all_reduce(tensor, *args, **kwargs)
+
+        with mock.patch("torch.distributed.all_reduce", side_effect=record_inter_dtype):
+            model.finish_grad_sync(force_all_reduce=force_all_reduce)
+        assert inter_dtypes == [torch.float32] * len(bucket_groups)
+
+        expected = torch.tensor(sum(rank_values) / Utils.world_size, dtype=torch.float32)
+        expected = expected.bfloat16().item()
         intra_rank = parallel_state.get_data_parallel_rank(
             with_context_parallel=True, partial_data_parallel=True
         )
-        for bucket in bucket_groups[0].buckets:
-            local_shard = shard_buffer(bucket.grad_data, Utils.world_size // 2)[intra_rank]
-            torch.testing.assert_close(
-                local_shard, torch.full_like(local_shard, 4.5), rtol=0, atol=0
-            )
+        for bucket_group in bucket_groups:
+            for bucket in bucket_group.buckets:
+                local_shard = shard_buffer(bucket.grad_data, Utils.world_size // 2)[intra_rank]
+                torch.testing.assert_close(
+                    local_shard, torch.full_like(local_shard, expected), rtol=0, atol=0
+                )
+                if force_all_reduce:
+                    torch.testing.assert_close(
+                        bucket.grad_data,
+                        torch.full_like(bucket.grad_data, expected),
+                        rtol=0,
+                        atol=0,
+                    )
     finally:
         Utils.destroy_model_parallel()
 
