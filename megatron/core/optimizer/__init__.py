@@ -698,6 +698,18 @@ def _get_megatron_optimizer_based_on_param_groups(
         optimizer = FP32Optimizer(optimizer, config, init_state_fn)
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
+    if (
+        isinstance(optimizer, DistributedOptimizer)
+        and optimizer.ddp_config.use_megatron_fsdp
+        and not USING_PYTORCH_OPTIMIZER
+        and config.use_precision_aware_optimizer
+        and getattr(optimizer.optimizer, "master_weights", None) is not None
+    ):
+        # MFSDP v1 already supplies its main weights to FusedAdam. This also
+        # applies when dense and expert parameters have separate optimizers.
+        optimizer.optimizer.master_weights = False
+        optimizer.optimizer.use_decoupled_grad = True
+
     if pg_collection is None or not hasattr(pg_collection, 'tp'):
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     tp_group = pg_collection.tp
@@ -1125,12 +1137,14 @@ def get_megatron_optimizer(
     dp_cp_group = process_groups_dict['dp_cp_group']
     intra_dp_cp_group = process_groups_dict['intra_dp_cp_group']
     intra_expt_dp_group = process_groups_dict['intra_expt_dp_group']
+    expt_dp_group = process_groups_dict['expt_dp_group']
     mp_group = process_groups_dict['mp_group']
     expt_tp_pp_group = process_groups_dict['expt_tp_pp_group']
     expt_tp_pp_with_egtp_remat_group = process_groups_dict['expt_tp_pp_with_egtp_remat_group']
     intra_dp_cp_group_gloo = process_groups_dict['intra_dp_cp_group_gloo']
     intra_expt_dp_group_gloo = process_groups_dict['intra_expt_dp_group_gloo']
     intra_dist_opt_group = process_groups_dict['intra_dist_opt_group']
+    intra_expt_dist_opt_group = process_groups_dict['intra_expt_dist_opt_group']
 
     # ``mp_group`` spans TP×GTP_remat×PP (GTP_remat-merged).
     model_parallel_rank = get_pg_rank(mp_group)
@@ -1141,10 +1155,49 @@ def get_megatron_optimizer(
     else:
         distributed_optimizer_instance_id = 0
 
+    if get_pg_size(expt_dp_group) > get_pg_size(intra_expt_dp_group):
+        expert_distributed_optimizer_instance_id = get_pg_rank(
+            process_groups_dict['inter_expt_dist_opt_group']
+        )
+    else:
+        expert_distributed_optimizer_instance_id = 0
+
     optimizers = []
     model_chunk_offset = 0
     ddp_config = model_chunks[0].ddp_config  # Use the first model chunk's DDP config
-    if ddp_config.use_megatron_fsdp:
+    separate_fsdp_optimizers = (
+        ddp_config.use_megatron_fsdp
+        and not is_mfsdp_v2
+        and intra_dist_opt_group is not intra_expt_dist_opt_group
+    )
+    if separate_fsdp_optimizers:
+        # MFSDP v1 normally combines both classes in one optimizer. Reuse the
+        # class-specific factory path when their gradient statistics differ.
+        def fsdp_stats_group(is_expert):
+            strategy = (
+                ddp_config.expert_data_parallel_sharding_strategy
+                if is_expert
+                else ddp_config.data_parallel_sharding_strategy
+            )
+            outer_strategy = (
+                ddp_config.expert_outer_dp_sharding_strategy
+                if is_expert
+                else ddp_config.outer_dp_sharding_strategy
+            )
+            if strategy == 'no_shard':
+                return expt_tp_pp_with_egtp_remat_group if is_expert else mp_group
+            if outer_strategy != 'no_shard':
+                # Outer shards are distinct rather than replicas. The caller's
+                # full optimizer domain must participate, including all instances.
+                return param_group_process_group or torch.distributed.group.WORLD
+            return intra_expt_dist_opt_group if is_expert else intra_dist_opt_group
+
+        intra_dist_opt_group, intra_expt_dist_opt_group = (
+            fsdp_stats_group(False),
+            fsdp_stats_group(True),
+        )
+
+    if ddp_config.use_megatron_fsdp and not separate_fsdp_optimizers:
         # For no_shard, gradients are replicated across DP ranks after all-reduce, so grad stats
         # should only be reduced over TP/PP (model_parallel_group) to avoid inflating the norm.
         if ddp_config.data_parallel_sharding_strategy == 'no_shard':
@@ -1203,21 +1256,6 @@ def get_megatron_optimizer(
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
                 pg_collection=pg_collection,
             )
-            if (
-                not USING_PYTORCH_OPTIMIZER
-                and config.use_precision_aware_optimizer
-                and not is_mfsdp_v2
-                and getattr(optimizer_part.optimizer, "master_weights", None) is not None
-            ):
-                # NOTE(@cspades): FusedAdam is provided Megatron-FSDP's main weights as
-                # non-quantized DTensor(s). Megatron-FSDP should NEVER use FusedAdam's
-                # main weights, complete waste of memory as the optimizer step is still
-                # applied to the Megatron-FSDP main weight and extended to FusedAdam
-                # main weights. Override this here.
-                setattr(optimizer_part.optimizer, "master_weights", False)
-                # Megatron-FSDP always uses a decoupled gradient when using FusedAdam.
-                setattr(optimizer_part.optimizer, "use_decoupled_grad", True)
-
             optimizers.append(optimizer_part)
             model_chunk_offset += 1
 
@@ -1304,8 +1342,8 @@ def get_megatron_optimizer(
                 data_parallel_group=intra_expt_dp_group,
                 data_parallel_group_gloo=expt_data_parallel_group_gloo,
                 data_parallel_group_idx=expt_model_parallel_rank,
-                intra_dist_opt_group=intra_dist_opt_group,
-                distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                intra_dist_opt_group=intra_expt_dist_opt_group,
+                distributed_optimizer_instance_id=expert_distributed_optimizer_instance_id,
                 pg_collection=pg_collection,
             )
         )

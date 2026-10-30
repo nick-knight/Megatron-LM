@@ -499,12 +499,7 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
 
         if enable_hsdp:
             if self.num_moe_experts is not None:
-                expt_mesh = _get_hsdp_tp_mesh(
-                    outer_expt_fsdp_group,
-                    expt_dp_group,
-                    expt_tp_group,
-                    ep_size=ep_group.size(),
-                )
+                expt_mesh = _get_hsdp_tp_mesh(outer_expt_fsdp_group, expt_dp_group, expt_tp_group)
                 expt_device_mesh = DeviceMesh.from_group(
                     [outer_expt_fsdp_group, expt_dp_group, expt_tp_group],
                     device_type="cuda",
@@ -1121,28 +1116,7 @@ def _build_hybrid_dp_mesh(outer_group, inner_group, device_type):
             "MFSDP v2 hybrid sharding requires inter- and intra-instance process groups."
         )
 
-    rank = dist.get_rank()
-    inner_ranks = dist.get_process_group_ranks(inner_group)
-    outer_ranks = dist.get_process_group_ranks(outer_group)
-    outer_offsets = torch.tensor(outer_ranks) - rank
-    inner_offsets = torch.tensor(inner_ranks) - rank
-    layout = rank + outer_offsets[:, None] + inner_offsets[None, :]
-
-    # Sort the mesh ranks into outer-to-inner order, then check that this rank's
-    # row and column match its inner and outer process groups, respectively.
-    expected_layout = layout.flatten().sort().values.reshape(layout.shape)
-    expected_inner = expected_layout[outer_group.rank()].tolist()
-    expected_outer = expected_layout[:, inner_group.rank()].tolist()
-    if inner_ranks != expected_inner:
-        raise ValueError(
-            f"MFSDP v2 hybrid mesh row {expected_inner} does not match the intra "
-            f"data-parallel group {inner_ranks}."
-        )
-    if outer_ranks != expected_outer:
-        raise ValueError(
-            f"MFSDP v2 hybrid mesh column {expected_outer} does not match the inter "
-            f"distributed-optimizer group {outer_ranks}."
-        )
+    layout = _mesh_from_process_groups([outer_group, inner_group])
 
     return DeviceMesh.from_group(
         [outer_group, inner_group],
@@ -1152,73 +1126,33 @@ def _build_hybrid_dp_mesh(outer_group, inner_group, device_type):
     )
 
 
-def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):
-    assert HAVE_EINOPS, "einops is not installed. Please install it with `pip install einops`."
-    world_size = dist.get_world_size()
+def _mesh_from_process_groups(groups):
+    """Recover a Cartesian mesh using the strides of the actual process groups.
 
-    mesh = einops.rearrange(
-        torch.arange(world_size),
-        "(outer_fsdp_dp fsdp ep tp) -> ep outer_fsdp_dp fsdp tp",
-        outer_fsdp_dp=outer_fsdp_dp_group.size(),
-        tp=tp_group.size(),
-        ep=ep_size,
-    )
-
-    mesh_fsdp_ranks = einops.rearrange(
-        mesh,
-        'ep outer_fsdp_dp fsdp tp -> (outer_fsdp_dp ep tp) fsdp',
-        tp=tp_group.size(),
-        fsdp=dp_cp_group.size(),
-        ep=ep_size,
-    )
-    fsdp_group_ranks = dist.get_process_group_ranks(dp_cp_group)
-    assert _check_mesh_ranks_and_group_ranks_are_consistent(mesh_fsdp_ranks, fsdp_group_ranks), (
-        f"[Megatron-FSDP] FSDP ranks in the mesh {mesh_fsdp_ranks} "
-        f"do not match the ranks in the FSDP group {fsdp_group_ranks}."
-    )
-
-    mesh_tp_ranks = einops.rearrange(
-        mesh,
-        'ep outer_fsdp_dp fsdp tp -> (outer_fsdp_dp fsdp ep) tp',
-        tp=tp_group.size(),
-        fsdp=dp_cp_group.size(),
-    )
-    tp_group_ranks = dist.get_process_group_ranks(tp_group)
-    assert _check_mesh_ranks_and_group_ranks_are_consistent(mesh_tp_ranks, tp_group_ranks), (
-        f"[Megatron-FSDP] Tensor Parallel ranks in the mesh {mesh_tp_ranks} "
-        f"do not match the ranks in the TP group {tp_group_ranks}."
-    )
-
-    mesh_outer_fsdp_dp_ranks = einops.rearrange(
-        mesh,
-        'ep outer_fsdp_dp fsdp tp -> (fsdp ep tp) outer_fsdp_dp',
-        tp=tp_group.size(),
-        fsdp=dp_cp_group.size(),
-        ep=ep_size,
-    )
-    outer_fsdp_dp_group_ranks = dist.get_process_group_ranks(outer_fsdp_dp_group)
-    assert _check_mesh_ranks_and_group_ranks_are_consistent(
-        mesh_outer_fsdp_dp_ranks, outer_fsdp_dp_group_ranks
-    ), (
-        f"[Megatron-FSDP] Outer FSDP Data Parallel ranks in the mesh {mesh_outer_fsdp_dp_ranks} "
-        f"do not match the ranks in the Outer FSDP DP group {outer_fsdp_dp_group_ranks}."
-    )
-
-    # Exclude the expert parallel dimension
+    Megatron's rank generators use additive strides for each grid axis. Keep the
+    groups' coordinate order: sorting global ranks can swap the inner and outer
+    axes when the dense and expert grids use different rank orderings.
+    """
     rank = dist.get_rank()
-    dp_tp_meshes = [per_ep_mesh for per_ep_mesh in mesh if rank in per_ep_mesh.reshape(-1).tolist()]
-    assert (
-        len(dp_tp_meshes) == 1
-    ), f"[Megatron-FSDP] Current rank {rank} is not unique in the mesh ranks {mesh.tolist()}."
-    assert (
-        len(dp_tp_meshes[0].reshape(-1).tolist())
-        == outer_fsdp_dp_group.size() * dp_cp_group.size() * tp_group.size()
-    ), (
-        f"[Megatron-FSDP] DP-TP mesh size {len(dp_tp_meshes[0].reshape(-1).tolist())} "
-        f"does not match the expected size"
-        f"{outer_fsdp_dp_group.size() * dp_cp_group.size() * tp_group.size()}."
-    )
-    return dp_tp_meshes[0]
+    mesh = torch.full([1] * len(groups), rank, dtype=torch.int64)
+    for axis, group in enumerate(groups):
+        shape = [1] * len(groups)
+        shape[axis] = group.size()
+        offsets = torch.tensor(dist.get_process_group_ranks(group)) - rank
+        mesh = mesh + offsets.reshape(shape)
+    if (
+        mesh.unique().numel() != mesh.numel()
+        or mesh.min() < 0
+        or mesh.max() >= dist.get_world_size()
+    ):
+        raise ValueError("FSDP process groups do not form a Cartesian rank mesh")
+    return mesh
+
+
+def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group):
+    # EP (and PP) coordinates are already fixed by these groups, so neither
+    # their sizes nor a particular global rank order need to be inferred.
+    return _mesh_from_process_groups([outer_fsdp_dp_group, dp_cp_group, tp_group])
 
 
 def _get_dp_tp_mesh(dp_cp_group, tp_group, ep_size=1):

@@ -406,6 +406,10 @@ class MegatronOptimizer(ABC):
 
     def _uses_decoupled_grad(self, param_list) -> bool:
         """Whether clip_grad_norm/count_zeros should read `.decoupled_grad` instead of `.grad`."""
+        if not param_list:
+            # Ranks without local parameters still participate in class-specific
+            # statistics reductions, contributing zero regardless of grad storage.
+            return False
         if hasattr(param_list[0], "_mfsdp_parameter_group"):
             # MFSDP v2 always reduces directly into `.grad`.
             return False

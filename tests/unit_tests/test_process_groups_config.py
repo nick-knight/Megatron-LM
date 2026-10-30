@@ -43,6 +43,8 @@ class TestProcessGroupsConfig:
         for groups in (ddp_groups, optimizer_groups):
             assert groups["dp_cp_group"] is replicas
             assert groups["intra_dp_cp_group"] is replicas
+        assert optimizer_groups["intra_expt_dist_opt_group"] is other
+        assert optimizer_groups["inter_expt_dist_opt_group"] is None
 
     def test_transformer_process_groups(self, mocker):
         """Test basic functionality of TransformerProcessGroups."""

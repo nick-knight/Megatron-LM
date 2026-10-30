@@ -665,18 +665,28 @@ The DP collective only covers the replicate axis; the gtp_remat axis is complete
 
 With `--separate-dense-expert-inter-instance-groups`, dense and expert gradients use
 their own inter-instance communicators. This permits different *ordered peers* for
-the two parameter classes. It also replaces the extra `instances | dense DP` check
-with the actual `instances | dense weight-replica group size` requirement. With GTP
-sequence sharding, that group can be larger than dense DP, so a configuration
+the two parameter classes and independent optimizer-instance assignments. Each class
+gets a statistics group covering one complete copy of its gradient shards, and its
+own checkpoint replica IDs. The chained optimizer combines the class norms as
+`sqrt(dense_norm**2 + expert_norm**2)` and uses the result to clip both classes.
+It also replaces the extra `instances | dense DP` check with the actual
+`instances | dense weight-replica group size` requirement. That
+group includes CP weight replicas and can be larger than dense DP, so a configuration
 rejected by the legacy check may be valid. Expert DP must still be divisible by
-the instance count. The flag requires more than one optimizer instance; both layouts
-must still assign every rank the same instance ID, since optimizer-wide gradient
-statistics use one shared instance group. CP peers may span optimizer instances in
+the instance count. The flag requires more than one optimizer instance. Every dense
+instance must contain complete dense weight shards, and every expert instance must
+contain complete expert weight shards; the two classes need not assign the same
+instance ID to a rank. CP peers may span optimizer instances in
 these newly permitted layouts, so place such instances within a site if CP traffic
 must remain site-local. Without the flag, both bucket
 classes use the expert-derived inter-instance group as before. The separate dense
 communicator can be configured under `inter_dp_cp` in the NCCL communicator config;
-the expert communicator continues to use `inter_ep_dp`.
+the expert communicator continues to use `inter_ep_dp`. Statistics communicators use
+`intra_dist_opt_instance` and `intra_expt_dist_opt_instance`, respectively. Core
+callers supplying a `ProcessGroupCollection` can use `inter_expt_dist_opt` and
+`intra_expt_dist_opt` for the expert communicators; older collections continue to
+use the shared groups. Megatron-FSDP v1 uses separate dense and expert optimizers
+in this mode so that each class uses the appropriate statistics domain.
 
 ### 3.3 Distributed checkpointing (DCP)
 

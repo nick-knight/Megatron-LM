@@ -159,6 +159,7 @@ _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
 
 # Paralel group of all GPUs in a distributed optimizer instance
 _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
+_INTRA_EXPERT_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
@@ -647,18 +648,22 @@ def _optimizer_instance_rank_layout(rank_sets, num_instances):
     return instance_by_rank, inter_by_rank
 
 
-def _validate_optimizer_instance_layouts(dense_rank_sets, expert_rank_sets, num_instances, separate):
-    """Check the shared optimizer instance IDs and, in legacy mode, inter-instance peers."""
+def _validate_optimizer_instance_layouts(
+    dense_rank_sets, expert_rank_sets, num_instances, separate
+):
+    """Validate each hierarchy and the additional correspondence needed by legacy mode."""
     dense_ids, dense_peers = _optimizer_instance_rank_layout(dense_rank_sets, num_instances)
     expert_ids, expert_peers = _optimizer_instance_rank_layout(expert_rank_sets, num_instances)
-    if dense_ids != expert_ids:
+    if dense_ids.keys() != expert_ids.keys():
+        raise ValueError("Dense and expert optimizer-instance layouts must cover the same ranks")
+    if not separate and dense_ids != expert_ids:
         raise ValueError("Dense and expert optimizer-instance IDs disagree")
     if not separate and dense_peers != expert_peers:
         raise ValueError(
             "Dense and expert inter-instance peers disagree; enable "
             "separate_dense_expert_inter_instance_groups to use separate collectives"
         )
-    return dense_ids
+    return dense_ids, expert_ids
 
 
 # pylint: disable=C0301
@@ -774,8 +779,8 @@ def initialize_model_parallel(
             parallel group.
 
         separate_dense_expert_inter_instance_groups (bool, default = False):
-            Give dense and expert gradients their own inter-instance groups. Both
-            layouts must still assign each rank the same optimizer instance ID.
+            Give dense and expert gradients independent inter-instance and statistics
+            groups. Each layout determines its own optimizer instance IDs.
 
         gtp_remat_size (int, default = 1):
             Generalized tensor parallelism with weight rematerialization (GTP).
@@ -1023,7 +1028,7 @@ def initialize_model_parallel(
     if separate_dense_expert_inter_instance_groups and num_distributed_optimizer_instances < 2:
         raise ValueError("Separate inter-instance groups require multiple optimizer instances")
 
-    optimizer_instance_ids = None
+    dense_instance_ids = expert_instance_ids = None
     if (
         gtp_remat_size > 1 or expert_gtp_remat_size > 1
     ) and num_distributed_optimizer_instances > 1:
@@ -1045,9 +1050,7 @@ def initialize_model_parallel(
                 "instances to divide the expert data-parallel size (excluding ETP, EP, PP, and EGTP)"
             )
     if num_distributed_optimizer_instances > 1:
-        # Optimizer-wide statistics still use one instance ID per rank. Separate
-        # inter-instance groups only relax the requirement that peers coincide.
-        dense_instance_ids = _validate_optimizer_instance_layouts(
+        dense_instance_ids, expert_instance_ids = _validate_optimizer_instance_layouts(
             weight_replica_rank_sets,
             expert_decoder_rank_generator.get_ranks("dp"),
             num_distributed_optimizer_instances,
@@ -1060,9 +1063,8 @@ def initialize_model_parallel(
                 if len({dense_instance_ids[r] for r in shard_ranks}) != 1:
                     raise ValueError("GTP weight shards span optimizer instances")
             for shard_ranks in expert_decoder_rank_generator.get_ranks("gtp_remat"):
-                if len({dense_instance_ids[r] for r in shard_ranks}) != 1:
+                if len({expert_instance_ids[r] for r in shard_ranks}) != 1:
                     raise ValueError("Expert GTP weight shards span optimizer instances")
-            optimizer_instance_ids = dense_instance_ids
 
     timeout = timedelta(minutes=distributed_timeout_minutes)
 
@@ -1346,10 +1348,10 @@ def initialize_model_parallel(
             if rank in dp_cp_ranks:
                 _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = group
 
-            if optimizer_instance_ids is not None:
+            if dense_instance_ids is not None:
                 for instance_id in range(num_distributed_optimizer_instances):
                     instance_ranks = [
-                        r for r in dp_cp_ranks if optimizer_instance_ids[r] == instance_id
+                        r for r in dp_cp_ranks if dense_instance_ids[r] == instance_id
                     ]
                     instance_group = create_group(
                         instance_ranks,
@@ -1359,7 +1361,7 @@ def initialize_model_parallel(
                     )
                     if rank in instance_ranks:
                         _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = instance_group
-        if optimizer_instance_ids is None:
+        if dense_instance_ids is None:
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = (
                 _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT
             )
@@ -1785,11 +1787,9 @@ def initialize_model_parallel(
             )
             if rank in dp_ranks:
                 _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = group
-            if optimizer_instance_ids is not None:
+            if expert_instance_ids is not None:
                 for instance_id in range(num_distributed_optimizer_instances):
-                    instance_ranks = [
-                        r for r in dp_ranks if optimizer_instance_ids[r] == instance_id
-                    ]
+                    instance_ranks = [r for r in dp_ranks if expert_instance_ids[r] == instance_id]
                     instance_group = create_group(
                         instance_ranks,
                         timeout=timeout,
@@ -1798,7 +1798,7 @@ def initialize_model_parallel(
                     )
                     if rank in instance_ranks:
                         _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = instance_group
-        if optimizer_instance_ids is None:
+        if expert_instance_ids is None:
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = (
                 _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT
             )
@@ -1812,11 +1812,38 @@ def initialize_model_parallel(
 
     # build the intra distributed optimizer instance group
     global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
+    global _INTRA_EXPERT_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     assert (
         _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP is None
     ), "Intra distributed optimizer instance group is already initialized"
 
-    if gtp_remat_size > 1 or expert_gtp_remat_size > 1:
+    if separate_dense_expert_inter_instance_groups:
+        # Every class-specific instance covers exactly one copy of that class's
+        # optimizer shards, including all of its model-parallel coordinates.
+        for instance_ids, is_expert in ((dense_instance_ids, False), (expert_instance_ids, True)):
+            for instance_id in range(num_distributed_optimizer_instances):
+                instance_ranks = sorted(
+                    r for r, value in instance_ids.items() if value == instance_id
+                )
+                group = create_group(
+                    instance_ranks,
+                    timeout=timeout,
+                    pg_options=get_nccl_options(
+                        "intra_expt_dist_opt_instance" if is_expert else "intra_dist_opt_instance",
+                        nccl_comm_cfgs,
+                    ),
+                    group_desc=(
+                        "INTRA_EXPERT_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP"
+                        if is_expert
+                        else "INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP"
+                    ),
+                )
+                if rank in instance_ranks:
+                    if is_expert:
+                        _INTRA_EXPERT_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = group
+                    else:
+                        _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = group
+    elif gtp_remat_size > 1 or expert_gtp_remat_size > 1:
         # Gradient statistics need every model shard, including GTP and EGTP, but exactly
         # one copy of the optimizer state. The expert generator's ordinary per-instance
         # groups omit the remat axes, so collect all ranks assigned to each instance.
@@ -1826,8 +1853,8 @@ def initialize_model_parallel(
         for instance_id in range(num_distributed_optimizer_instances):
             instance_ranks = (
                 all_ranks
-                if optimizer_instance_ids is None
-                else [r for r in all_ranks if optimizer_instance_ids[r] == instance_id]
+                if dense_instance_ids is None
+                else [r for r in all_ranks if dense_instance_ids[r] == instance_id]
             )
             assert len(instance_ranks) == len(all_ranks) // num_distributed_optimizer_instances
             instance_group = create_group(
@@ -1854,6 +1881,11 @@ def initialize_model_parallel(
                 if rank in intra_dist_opt_ranks:
                     _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = intra_dist_opt_instance_group
                 intra_dist_opt_ranks = []
+
+    if not separate_dense_expert_inter_instance_groups:
+        _INTRA_EXPERT_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = (
+            _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
+        )
 
     # Initialize global memory buffer
     # This isn't really "parallel state" but there isn't another good place to
@@ -2769,12 +2801,21 @@ def get_expert_data_parallel_world_size(with_gtp_remat=True, partial_expert_data
 
 
 def get_intra_distributed_optimizer_instance_group(check_initialized=True):
-    """Get the group of all GPUs in a distributed optimizer instance."""
+    """Get the dense optimizer statistics group (shared with experts in legacy mode)."""
     if check_initialized:
         assert (
             _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP is not None
         ), "Intra distributed optimizer instance group is not initialized"
     return _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
+
+
+def get_intra_expert_distributed_optimizer_instance_group(check_initialized=True):
+    """Get the statistics group covering one complete expert optimizer instance."""
+    if check_initialized:
+        assert (
+            _INTRA_EXPERT_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP is not None
+        ), "Intra expert distributed optimizer instance group is not initialized"
+    return _INTRA_EXPERT_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
 
 
 def get_inter_distributed_optimizer_instance_group(check_initialized=True):
@@ -2785,16 +2826,18 @@ def get_inter_distributed_optimizer_instance_group(check_initialized=True):
         else _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     )
     if check_initialized:
-        assert group is not None, "Dense inter distributed optimizer instance group is not initialized"
+        assert (
+            group is not None
+        ), "Dense inter distributed optimizer instance group is not initialized"
     return group
 
 
 def get_inter_expert_distributed_optimizer_instance_group(check_initialized=True):
     """Get the expert inter-instance group (also shared by dense buckets in legacy mode)."""
     if check_initialized:
-        assert _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None, (
-            "Expert inter distributed optimizer instance group is not initialized"
-        )
+        assert (
+            _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None
+        ), "Expert inter distributed optimizer instance group is not initialized"
     return _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
 
 
@@ -3037,6 +3080,8 @@ def destroy_model_parallel():
 
     global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
+    global _INTRA_EXPERT_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
+    _INTRA_EXPERT_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 
     global _global_process_group_list
     _global_process_group_list = None

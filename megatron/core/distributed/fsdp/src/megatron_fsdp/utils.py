@@ -22,13 +22,6 @@ from functools import reduce
 from importlib.metadata import version
 from typing import Callable, Optional, Sequence, Tuple, Union
 
-try:
-    import einops
-
-    HAVE_EINOPS = True
-except ImportError:
-    HAVE_EINOPS = False
-
 import torch
 from packaging.version import Version as PkgVersion
 from torch import _C
@@ -775,33 +768,16 @@ class FSDPDistributedIndex:
         Raises:
             AssertionError: If full-shard hybrid FSDP is not enabled.
         """
-        assert HAVE_EINOPS, "get_logical_hybrid_fsdp_rank requires einops to be installed."
         assert (
             self.hsdp_outer_dp_shard
         ), "get_logical_hybrid_fsdp_rank is only valid when full-shard hybrid FSDP is enabled."
 
-        _hybrid_fsdp_group_name = (
-            "_hybrid_fsdp_group_ranks"
-            if not is_expert_parallel
-            else "_hybrid_fsdp_expt_group_ranks"
-        )
-
-        if not hasattr(self, _hybrid_fsdp_group_name):
-            dp_world_size = self.get_dp_group(is_expert_parallel).size()
-
-            # Reorder the flat ranks: (outer_dp, inner_dp) -> (inner_dp, outer_dp)
-            mesh = einops.rearrange(
-                torch.arange(dp_world_size),
-                "(outer_dp inner_dp) -> (inner_dp outer_dp)",
-                outer_dp=self.get_outer_fsdp_group(is_expert_parallel).size(),
-                inner_dp=self.get_fsdp_group(is_expert_parallel).size(),
-            )
-            setattr(self, _hybrid_fsdp_group_name, mesh.tolist())
-
-        # Find the index for the current rank in the hybrid group
-        return getattr(self, _hybrid_fsdp_group_name).index(
-            self.get_dp_group(is_expert_parallel).rank()
-        )
+        # Shard the gradient over the inner axis first, then over the outer
+        # axis. Use those groups' coordinates directly: the flattened DP group's
+        # rank order need not be outer-major for custom dense/expert layouts.
+        inner_group = self.get_fsdp_group(is_expert_parallel)
+        outer_group = self.get_outer_fsdp_group(is_expert_parallel)
+        return inner_group.rank() * outer_group.size() + outer_group.rank()
 
 
 class GlobalMemoryBuffer:

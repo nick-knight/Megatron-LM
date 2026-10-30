@@ -63,6 +63,8 @@ class ProcessGroupCollection:
         intra_expt_dp: Intra partial expert data parallel group
         inter_dist_opt: Dense inter distributed optimizer instance group
         inter_expt_dist_opt: Expert inter distributed optimizer instance group
+        intra_dist_opt: Dense optimizer statistics group
+        intra_expt_dist_opt: Expert optimizer statistics group
 
     Example:
         # Create instance and set needed process groups
@@ -189,6 +191,9 @@ class ProcessGroupCollection:
 
     # _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     intra_dist_opt: torch.distributed.ProcessGroup = field(init=False)
+
+    # _INTRA_EXPERT_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
+    intra_expt_dist_opt: torch.distributed.ProcessGroup = field(init=False)
 
     def __init__(self, **kwargs):
         for key in kwargs:
@@ -326,6 +331,10 @@ class ProcessGroupCollection:
                 parallel_state.get_intra_distributed_optimizer_instance_group,
                 check_initialized=False,
             ),
+            'intra_expt_dist_opt': partial(
+                parallel_state.get_intra_expert_distributed_optimizer_instance_group,
+                check_initialized=False,
+            ),
             # TODO (Hepteract): remove this once distributed checkpoint is refactored
             'expt_dp': partial(
                 parallel_state.get_expert_data_parallel_group,
@@ -398,6 +407,8 @@ class ProcessGroupCollection:
                 - expt_tp_pp_group: Expert tensor-model-pipeline parallel group
                 - inter_dist_opt_group: Inter distributed optimizer group (may be None)
                 - intra_dist_opt_group: Intra distributed optimizer group (may be None)
+                - inter_expt_dist_opt_group: Expert inter-instance group (may be None)
+                - intra_expt_dist_opt_group: Expert statistics group (may be None)
                 - intra_dp_cp_group_gloo: Gloo version of intra_dp_cp_group (may be None)
                 - intra_expt_dp_group_gloo: Gloo version of intra_expt_dp_group (may be None)
         """
@@ -424,6 +435,9 @@ class ProcessGroupCollection:
                 check_initialized=False
             )
             intra_dist_opt_group = parallel_state.get_intra_distributed_optimizer_instance_group()
+            intra_expt_dist_opt_group = (
+                parallel_state.get_intra_expert_distributed_optimizer_instance_group()
+            )
 
             # Gloo is not built under GTP_remat (the GTP_remat optimizer uses DCP); fetching the
             # absent group would assert, so gate on gtp_active and leave the Gloo groups None.
@@ -455,10 +469,15 @@ class ProcessGroupCollection:
                     inter_dist_opt_group = (
                         parallel_state.get_inter_distributed_optimizer_instance_group()
                     )
+                    inter_expt_dist_opt_group = (
+                        parallel_state.get_inter_expert_distributed_optimizer_instance_group()
+                    )
                 else:
                     inter_dist_opt_group = None
+                    inter_expt_dist_opt_group = None
             else:
                 inter_dist_opt_group = None
+                inter_expt_dist_opt_group = None
 
         else:
             # Use provided process group collection with validation and fallbacks
@@ -536,6 +555,23 @@ class ProcessGroupCollection:
                 inter_dist_opt_group = None
                 intra_dist_opt_group = None
 
+            inter_expt_dist_opt_group = (
+                pg_collection.inter_expt_dist_opt
+                if 'inter_expt_dist_opt' in pg_set
+                else inter_dist_opt_group
+            )
+            intra_expt_dist_opt_group = (
+                pg_collection.intra_expt_dist_opt
+                if 'intra_expt_dist_opt' in pg_set
+                else intra_dist_opt_group
+            )
+            if inter_expt_dist_opt_group is not inter_dist_opt_group and (
+                intra_expt_dist_opt_group is None or 'intra_expt_dist_opt' not in pg_set
+            ):
+                raise ValueError(
+                    "intra_expt_dist_opt must be provided with a separate inter_expt_dist_opt group"
+                )
+
             # 5. Model communication groups
             if 'mp' not in pg_set:
                 raise ValueError(
@@ -585,7 +621,9 @@ class ProcessGroupCollection:
             'expt_tp_pp_group': expt_tp_pp_group,
             'expt_tp_pp_with_egtp_remat_group': expt_tp_pp_with_egtp_remat_group,
             'inter_dist_opt_group': inter_dist_opt_group,
+            'inter_expt_dist_opt_group': inter_expt_dist_opt_group,
             'intra_dist_opt_group': intra_dist_opt_group,
+            'intra_expt_dist_opt_group': intra_expt_dist_opt_group,
             'intra_dp_cp_group_gloo': intra_dp_cp_group_gloo,
             'intra_expt_dp_group_gloo': intra_expt_dp_group_gloo,
         }

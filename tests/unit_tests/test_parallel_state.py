@@ -32,11 +32,66 @@ def test_separate_inter_instance_layout_validation():
     expert = [[0, 3], [1, 2]]
     with pytest.raises(ValueError, match="inter-instance peers disagree"):
         ps._validate_optimizer_instance_layouts(dense, expert, 2, separate=False)
-    assert ps._validate_optimizer_instance_layouts(dense, expert, 2, separate=True) == {
-        0: 0, 1: 0, 2: 1, 3: 1
-    }
+    dense_ids, expert_ids = ps._validate_optimizer_instance_layouts(dense, expert, 2, separate=True)
+    assert dense_ids == expert_ids == {0: 0, 1: 0, 2: 1, 3: 1}
     with pytest.raises(ValueError, match="instance IDs disagree"):
-        ps._validate_optimizer_instance_layouts(dense, [[0, 1], [2, 3]], 2, separate=True)
+        ps._validate_optimizer_instance_layouts(dense, [[0, 1], [2, 3]], 2, separate=False)
+    dense_ids, expert_ids = ps._validate_optimizer_instance_layouts(
+        dense, [[0, 1], [2, 3]], 2, separate=True
+    )
+    assert dense_ids != expert_ids
+
+
+@pytest.mark.parametrize("gtp", [False, True])
+def test_independent_dense_expert_optimizer_instances(gtp):
+    if world_size != 8:
+        pytest.skip("Test requires eight ranks")
+    kwargs = (
+        dict(context_parallel_size=4, gtp_remat_size=2, expert_gtp_remat_size=2)
+        if gtp
+        else dict(context_parallel_size=2, expert_model_parallel_size=2, order="tp-cp-dp-ep-pp")
+    )
+    try:
+        Utils.initialize_model_parallel(
+            **kwargs,
+            num_distributed_optimizer_instances=2,
+            separate_dense_expert_inter_instance_groups=True,
+        )
+        dense_id = (rank % 4) // 2 if gtp else rank // 4
+        expert_id = rank // 4 if gtp else (rank % 4) // 2
+        dense_ranks = [r for r in range(8) if ((r % 4) // 2 if gtp else r // 4) == dense_id]
+        expert_ranks = [r for r in range(8) if (r // 4 if gtp else (r % 4) // 2) == expert_id]
+        assert (
+            torch.distributed.get_process_group_ranks(
+                ps.get_intra_distributed_optimizer_instance_group()
+            )
+            == dense_ranks
+        )
+        assert (
+            torch.distributed.get_process_group_ranks(
+                ps.get_intra_expert_distributed_optimizer_instance_group()
+            )
+            == expert_ranks
+        )
+        assert ps.get_inter_distributed_optimizer_instance_group().rank() == dense_id
+        assert ps.get_inter_expert_distributed_optimizer_instance_group().rank() == expert_id
+        for full, partial, instance in (
+            (
+                ps.get_data_parallel_group(with_context_parallel=True),
+                ps.get_data_parallel_group(with_context_parallel=True, partial_data_parallel=True),
+                dense_ranks,
+            ),
+            (
+                ps.get_expert_data_parallel_group(),
+                ps.get_expert_data_parallel_group(partial_expert_data_parallel=True),
+                expert_ranks,
+            ),
+        ):
+            assert set(torch.distributed.get_process_group_ranks(partial)) == set(
+                torch.distributed.get_process_group_ranks(full)
+            ).intersection(instance)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_cp_more_local_than_gtp_remat_rank_layout():
@@ -136,6 +191,11 @@ def test_gtp_optimizer_instances_keep_model_shards_local(sequence_shards, separa
         instance_ranks = list(range((rank // 4) * 4, (rank // 4 + 1) * 4))
         inter_ranks = [rank % 4, rank % 4 + 4]
         assert ranks(ps.get_intra_distributed_optimizer_instance_group()) == instance_ranks
+        assert ranks(ps.get_intra_expert_distributed_optimizer_instance_group()) == instance_ranks
+        assert (
+            ps.get_intra_distributed_optimizer_instance_group()
+            is ps.get_intra_expert_distributed_optimizer_instance_group()
+        ) == (not separate_groups)
         assert ranks(ps.get_inter_distributed_optimizer_instance_group()) == inter_ranks
         assert ranks(ps.get_inter_expert_distributed_optimizer_instance_group()) == inter_ranks
         assert (
@@ -211,9 +271,7 @@ def test_separate_inter_groups_allow_gtp_sequence_sharded_dense_dp():
         Utils.destroy_model_parallel()
 
     try:
-        Utils.initialize_model_parallel(
-            **kwargs, separate_dense_expert_inter_instance_groups=True
-        )
+        Utils.initialize_model_parallel(**kwargs, separate_dense_expert_inter_instance_groups=True)
         dense_inter = ps.get_inter_distributed_optimizer_instance_group()
         expert_inter = ps.get_inter_expert_distributed_optimizer_instance_group()
         assert dense_inter is not expert_inter
@@ -221,20 +279,21 @@ def test_separate_inter_groups_allow_gtp_sequence_sharded_dense_dp():
         for group in (dense_inter, expert_inter):
             value = torch.tensor([rank + 1.0], device="cuda")
             torch.distributed.all_reduce(value, group=group)
-            expected = sum(
-                peer + 1 for peer in torch.distributed.get_process_group_ranks(group)
-            )
+            expected = sum(peer + 1 for peer in torch.distributed.get_process_group_ranks(group))
             assert value.item() == expected
-        assert ps.get_data_parallel_group(
-            with_context_parallel=True, with_gtp_remat=False, partial_data_parallel=True
-        ).size() == 1
+        assert (
+            ps.get_data_parallel_group(
+                with_context_parallel=True, with_gtp_remat=False, partial_data_parallel=True
+            ).size()
+            == 1
+        )
         assert ps.get_expert_data_parallel_group(partial_expert_data_parallel=True).size() == 1
         instance_ranks = torch.distributed.get_process_group_ranks(
             ps.get_intra_distributed_optimizer_instance_group()
         )
-        assert set(torch.distributed.get_process_group_ranks(
-            ps.get_gtp_weight_remat_group()
-        )).issubset(instance_ranks)
+        assert set(
+            torch.distributed.get_process_group_ranks(ps.get_gtp_weight_remat_group())
+        ).issubset(instance_ranks)
     finally:
         Utils.destroy_model_parallel()
 
