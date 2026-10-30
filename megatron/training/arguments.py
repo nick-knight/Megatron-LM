@@ -110,13 +110,10 @@ def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False,
         load_args_from_checkpoint(args, load_arg='pretrained_checkpoint')
         load_args_from_checkpoint(args)
 
-    # Check launcher placement before either CLI or YAML model validation.
-    _validate_site_args(args)
     if args.yaml_cfg is not None:
         from megatron.training.yaml_arguments import validate_yaml
 
         args = validate_yaml(args, args_defaults)
-        _validate_site_args(args)
     else:
         validate_args(args, args_defaults)
 
@@ -429,25 +426,6 @@ def tuple_type(x):
     return tuple(int(i) for i in x.strip('()').split(','))
 
 
-def _validate_site_args(args):
-    """Validate placement options before constructing any distributed process groups."""
-    site_id = getattr(args, 'site_id', None)
-    if site_id is None:
-        return
-    if type(site_id) is not int or site_id < 0:
-        raise ValueError('--site-id must be a nonnegative integer')
-    if getattr(args, 'dynamic_context_parallel', False) or getattr(
-        args, 'hybrid_context_parallel', False
-    ):
-        # The site count is not known yet. Treat any explicit --site-id as opting
-        # into site placement; dynamic CP currently schedules over global DPxCP.
-        raise ValueError(
-            '--site-id cannot be combined with dynamic context parallelism '
-            '(including --hybrid-context-parallel): dynamic context parallelism '
-            'requires site-restricted domains, which are not yet supported'
-        )
-
-
 def validate_args(args, defaults={}):
 
     # Prep for checkpoint conversion.
@@ -633,8 +611,21 @@ def validate_args(args, defaults={}):
         else:
             setattr(args, key, defaults[key])
 
-    # Cover direct validate_args callers and placement supplied through defaults.
-    _validate_site_args(args)
+    # Site placement is optional and must be checked after applying defaults.
+    site_id = getattr(args, 'site_id', None)
+    if site_id is not None and (type(site_id) is not int or site_id < 0):
+        raise ValueError('--site-id must be a nonnegative integer')
+    if site_id is not None and (
+        getattr(args, 'dynamic_context_parallel', False)
+        or getattr(args, 'hybrid_context_parallel', False)
+    ):
+        # The site count is not known yet. Treat any explicit --site-id as opting
+        # into site placement; dynamic CP currently schedules over global DPxCP.
+        raise ValueError(
+            '--site-id cannot be combined with dynamic context parallelism '
+            '(including --hybrid-context-parallel): dynamic context parallelism '
+            'requires site-restricted domains, which are not yet supported'
+        )
 
     if args.data_path is not None and args.split is None:
         legacy_default_split_value = '969, 30, 1'

@@ -2627,7 +2627,8 @@ def initialize_site_parallel(
     IDs are None, site placement is disabled. Otherwise every rank must supply a
     nonnegative ID. Sites may contain arbitrary rank sets, provided the constructed
     model, context, and expert parallel groups remain within sites. Distributed
-    optimizer sharding groups and instances must also remain within sites when used.
+    optimizer sharding groups must also remain within sites when used. Together
+    with the model-parallel axes, these imply locality of each optimizer instance.
     Dynamic CP is unsupported with explicit site placement until its scheduling
     domain can be restricted to a site.
 
@@ -2664,9 +2665,12 @@ def initialize_site_parallel(
             "expert model-parallel groups": _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP,
         }
         if require_complete_optimizer_instances:
+            # Check the groups carrying gradient and parameter shards. Each class's
+            # aggregate statistics group is the connected union of its model-parallel
+            # axes and intra-instance sharding groups, so its locality is implied.
+            # This also holds when dense and expert instance assignments differ.
             locality_groups.update(
                 {
-                    "distributed-optimizer instances": _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP,
                     "dense optimizer sharding groups": _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP,
                     "expert optimizer sharding groups": _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP,
                 }

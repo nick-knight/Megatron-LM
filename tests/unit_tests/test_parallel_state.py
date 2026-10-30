@@ -151,9 +151,10 @@ def test_site_groups_allow_nonuniform_instance_counts_across_three_sites():
         ps.initialize_site_parallel(site_id, require_complete_optimizer_instances=True)
         assert ps.get_site_id() == site_id
         assert ps.get_site_global_ranks() == expected[site_id]
-        assert tuple(torch.distributed.get_process_group_ranks(ps.get_site_group())) == expected[
-            site_id
-        ]
+        assert (
+            tuple(torch.distributed.get_process_group_ranks(ps.get_site_group()))
+            == expected[site_id]
+        )
         for site_group, world_group in (
             (ps.get_site_data_parallel_group(), ps.get_data_parallel_group()),
             (
@@ -180,7 +181,7 @@ def test_site_groups_reject_split_optimizer_instances():
 
     try:
         Utils.initialize_model_parallel(num_distributed_optimizer_instances=2)
-        with pytest.raises(ValueError, match="complete distributed-optimizer instances"):
+        with pytest.raises(ValueError, match="complete dense optimizer sharding groups"):
             ps.initialize_site_parallel(rank % 2, require_complete_optimizer_instances=True)
     finally:
         Utils.destroy_model_parallel()
@@ -255,6 +256,37 @@ def test_site_groups_allow_noncontiguous_ranks():
             assert value.item() == sum(
                 peer + 1 for peer in torch.distributed.get_process_group_ranks(group)
             )
+        # Local model and sharding axes imply locality of the aggregate instance.
+        assert set(
+            torch.distributed.get_process_group_ranks(
+                ps.get_intra_distributed_optimizer_instance_group()
+            )
+        ).issubset(expected)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("is_expert", [False, True])
+def test_site_groups_validate_each_optimizer_sharding_group(monkeypatch, is_expert):
+    """Validate actual sharding groups independently of the aggregate statistics group."""
+    if world_size != 8:
+        pytest.skip("Test requires eight ranks")
+
+    try:
+        Utils.initialize_model_parallel(num_distributed_optimizer_instances=world_size)
+        name = (
+            "_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP"
+            if is_expert
+            else "_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP"
+        )
+        # Keep model and statistics groups local, but simulate a sharding group
+        # that spans sites. Each parameter class must be checked in its own right.
+        kind = "expert" if is_expert else "dense"
+        with monkeypatch.context() as patch:
+            patch.setattr(ps, name, ps.get_data_parallel_group(with_context_parallel=True))
+            with pytest.raises(ValueError, match=f"complete {kind} optimizer sharding groups"):
+                ps.initialize_site_parallel(rank // 4, require_complete_optimizer_instances=True)
+        assert ps.get_site_group(check_initialized=False) is None
     finally:
         Utils.destroy_model_parallel()
 
