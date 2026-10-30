@@ -3166,9 +3166,10 @@ def _add_distributed_args(parser):
                        help='Number of Distributed Optimizer copies across Data Parallel domain.')
     group.add_argument('--site-id', type=int, default=None,
                        help='Physical-site ID supplied by the launcher. All ranks at a site '
-                            'must share an ID, and each site must occupy one contiguous rank '
-                            'block containing complete model replicas. Distributed optimizer '
-                            'instances must also stay within sites when used.')
+                            'must share an ID. Supply it on every rank or omit it everywhere. '
+                            'Constructed model, context, and expert parallel groups must stay '
+                            'within sites; optimizer instances and sharding groups must also '
+                            'stay within sites when used. Site ranks need not be contiguous.')
     group.add_argument('--torch-fsdp2-no-reshard-after-forward', action='store_false', dest='torch_fsdp2_reshard_after_forward',
                        help='Whether to reshard weights after forward pass when using PyTorch FSDP2. '
                        'Set to enable FSDP ZeRO-2.')

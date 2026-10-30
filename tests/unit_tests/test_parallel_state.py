@@ -174,16 +174,14 @@ def test_site_groups_allow_nonuniform_instance_counts_across_three_sites():
 
 
 def test_site_groups_reject_split_optimizer_instances():
-    """Contiguous site ranks are insufficient if PP interleaves the instances."""
+    """Complete model groups alone do not ensure optimizer sharding is local."""
     if world_size != 8:
         pytest.skip("Test requires eight ranks")
 
     try:
-        Utils.initialize_model_parallel(
-            pipeline_model_parallel_size=2, num_distributed_optimizer_instances=2
-        )
+        Utils.initialize_model_parallel(num_distributed_optimizer_instances=2)
         with pytest.raises(ValueError, match="complete distributed-optimizer instances"):
-            ps.initialize_site_parallel(rank // 4, require_complete_optimizer_instances=True)
+            ps.initialize_site_parallel(rank % 2, require_complete_optimizer_instances=True)
     finally:
         Utils.destroy_model_parallel()
 
@@ -224,6 +222,111 @@ def test_site_groups_reject_split_model_replicas_without_distributed_optimizer()
         Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
         with pytest.raises(ValueError, match="complete model-parallel replicas"):
             ps.initialize_site_parallel(rank // 4)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_site_groups_allow_noncontiguous_ranks():
+    if world_size != 8:
+        pytest.skip("Test requires eight ranks")
+
+    try:
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=2, num_distributed_optimizer_instances=4
+        )
+        site_id = (rank // 2) % 2
+        ps.initialize_site_parallel(site_id, require_complete_optimizer_instances=True)
+        expected = (0, 1, 4, 5) if site_id == 0 else (2, 3, 6, 7)
+        assert ps.get_site_global_ranks() == expected
+        assert tuple(torch.distributed.get_process_group_ranks(ps.get_site_group())) == expected
+        site_dp_ranks = torch.distributed.get_process_group_ranks(
+            ps.get_site_data_parallel_group(with_context_parallel=True)
+        )
+        dp_ranks = torch.distributed.get_process_group_ranks(
+            ps.get_data_parallel_group(with_context_parallel=True)
+        )
+        assert set(site_dp_ranks) == set(dp_ranks).intersection(expected)
+        for group in (
+            ps.get_site_group(),
+            ps.get_site_data_parallel_group(with_context_parallel=True),
+        ):
+            value = torch.tensor([rank + 1.0], device="cuda")
+            torch.distributed.all_reduce(value, group=group)
+            assert value.item() == sum(
+                peer + 1 for peer in torch.distributed.get_process_group_ranks(group)
+            )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize(
+    "axis", ["context", "expert", "dynamic_context", "dynamic_context_full_minimum"]
+)
+def test_site_groups_reject_split_activation_groups(axis):
+    if world_size != 8:
+        pytest.skip("Test requires eight ranks")
+
+    kwargs = {
+        "context": dict(context_parallel_size=2),
+        "expert": dict(expert_model_parallel_size=2),
+        "dynamic_context": dict(dynamic_context_parallel=True),
+        "dynamic_context_full_minimum": dict(
+            dynamic_context_parallel=True, min_dynamic_context_parallel_size=8
+        ),
+    }[axis]
+    try:
+        Utils.initialize_model_parallel(**kwargs)
+        site_id = rank // 4 if axis.startswith("dynamic_context") else rank % 2
+        pattern = "context-parallel groups" if axis != "expert" else "expert model-parallel groups"
+        with pytest.raises(ValueError, match=pattern):
+            ps.initialize_site_parallel(site_id)
+        assert ps.get_site_group(check_initialized=False) is None
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_site_groups_reject_cp_spanning_complete_optimizer_instances():
+    """Optimizer instances can fit within sites while a CP group spans two sites."""
+    if world_size != 8:
+        pytest.skip("Test requires eight ranks")
+
+    try:
+        Utils.initialize_model_parallel(
+            context_parallel_size=4, num_distributed_optimizer_instances=4
+        )
+        with pytest.raises(ValueError, match="context-parallel groups"):
+            ps.initialize_site_parallel(
+                0 if rank < 2 else 1, require_complete_optimizer_instances=True
+            )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_site_groups_disabled_when_all_ids_omitted():
+    try:
+        Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
+        ps.initialize_site_parallel(None)
+        assert ps.get_site_id() is None
+        assert ps.get_site_group(check_initialized=False) is None
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_site_groups_reject_mixed_opt_in():
+    try:
+        Utils.initialize_model_parallel()
+        with pytest.raises(ValueError, match="every rank or omitted on every rank"):
+            ps.initialize_site_parallel(0 if rank == 0 else None)
+        assert ps.get_site_group(check_initialized=False) is None
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_site_groups_reject_inconsistent_optimizer_requirements():
+    try:
+        Utils.initialize_model_parallel()
+        with pytest.raises(ValueError, match="placement requirements must match"):
+            ps.initialize_site_parallel(0, require_complete_optimizer_instances=(rank == 0))
     finally:
         Utils.destroy_model_parallel()
 
