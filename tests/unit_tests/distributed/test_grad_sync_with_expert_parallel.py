@@ -275,7 +275,8 @@ def test_expert_grad_sync_uses_expert_data_parallel_group(
         Utils.destroy_model_parallel()
 
 
-def test_replicated_expert_grad_sync_with_gtp_optimizer_instances():
+@pytest.mark.parametrize("separate_groups", [False, True])
+def test_replicated_expert_grad_sync_with_gtp_optimizer_instances(separate_groups):
     """Expert DP reduction and EGTP completion cover each distinct-data rank once."""
     if Utils.world_size != 8:
         pytest.skip("Test requires eight ranks")
@@ -294,6 +295,7 @@ def test_replicated_expert_grad_sync_with_gtp_optimizer_instances():
             gtp_remat_size=2,
             expert_gtp_remat_size=2,
             num_distributed_optimizer_instances=2,
+            separate_dense_expert_inter_instance_groups=separate_groups,
         )
         config = TransformerConfig(
             num_layers=1,
@@ -317,6 +319,16 @@ def test_replicated_expert_grad_sync_with_gtp_optimizer_instances():
                 overlap_grad_reduce=False,
             ),
             module=ToyModule(config),
+        )
+        assert all(
+            group.inter_distributed_optimizer_instance_group
+            is parallel_state.get_inter_distributed_optimizer_instance_group()
+            for group in ddp.bucket_groups
+        )
+        assert all(
+            group.inter_distributed_optimizer_instance_group
+            is parallel_state.get_inter_expert_distributed_optimizer_instance_group()
+            for group in ddp.expert_parallel_bucket_groups
         )
         ddp.zero_grad_buffer()
         for param in ddp.parameters():

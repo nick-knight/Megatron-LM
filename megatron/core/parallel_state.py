@@ -75,6 +75,7 @@ _EXPERT_DATA_PARALLEL_GROUP_GLOO = None
 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = None
 _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
+_INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
 # Full expert data-parallel groups: span the egtp_remat axis, for data distribution.
 _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = None
 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = None
@@ -625,6 +626,41 @@ def _inject_gtp_remat_axis(order_str: str, after: str = "cp") -> str:
     return "-".join(toks)
 
 
+def _optimizer_instance_rank_layout(rank_sets, num_instances):
+    """Map each rank to its instance ID and ordered inter-instance peers."""
+    instance_by_rank = {}
+    inter_by_rank = {}
+    for ranks in rank_sets:
+        if len(ranks) % num_instances:
+            raise ValueError(
+                f"Replica group size {len(ranks)} must be divisible by "
+                f"num_distributed_optimizer_instances ({num_instances})"
+            )
+        local_size = len(ranks) // num_instances
+        for local_index in range(local_size):
+            peers = tuple(ranks[i * local_size + local_index] for i in range(num_instances))
+            for instance_id, peer in enumerate(peers):
+                if peer in instance_by_rank:
+                    raise ValueError(f"Rank {peer} occurs in multiple optimizer replica groups")
+                instance_by_rank[peer] = instance_id
+                inter_by_rank[peer] = peers
+    return instance_by_rank, inter_by_rank
+
+
+def _validate_optimizer_instance_layouts(dense_rank_sets, expert_rank_sets, num_instances, separate):
+    """Check the shared optimizer instance IDs and, in legacy mode, inter-instance peers."""
+    dense_ids, dense_peers = _optimizer_instance_rank_layout(dense_rank_sets, num_instances)
+    expert_ids, expert_peers = _optimizer_instance_rank_layout(expert_rank_sets, num_instances)
+    if dense_ids != expert_ids:
+        raise ValueError("Dense and expert optimizer-instance IDs disagree")
+    if not separate and dense_peers != expert_peers:
+        raise ValueError(
+            "Dense and expert inter-instance peers disagree; enable "
+            "separate_dense_expert_inter_instance_groups to use separate collectives"
+        )
+    return dense_ids
+
+
 # pylint: disable=C0301
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
@@ -653,6 +689,7 @@ def initialize_model_parallel(
     dynamic_context_parallel: bool = False,
     min_dynamic_context_parallel_size: int = 1,
     gtp_remat_num_sequence_shards: int = 1,
+    separate_dense_expert_inter_instance_groups: bool = False,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -735,6 +772,10 @@ def initialize_model_parallel(
         expert_model_parallel_size (int, default = 1):
             The number of Mixture of Experts parallel GPUs in each expert
             parallel group.
+
+        separate_dense_expert_inter_instance_groups (bool, default = False):
+            Give dense and expert gradients their own inter-instance groups. Both
+            layouts must still assign each rank the same optimizer instance ID.
 
         gtp_remat_size (int, default = 1):
             Generalized tensor parallelism with weight rematerialization (GTP).
@@ -979,14 +1020,21 @@ def initialize_model_parallel(
         f"and {expert_decoder_rank_generator.get_ranks('pp')}"
     )
 
+    if separate_dense_expert_inter_instance_groups and num_distributed_optimizer_instances < 2:
+        raise ValueError("Separate inter-instance groups require multiple optimizer instances")
+
     optimizer_instance_ids = None
     if (
         gtp_remat_size > 1 or expert_gtp_remat_size > 1
     ) and num_distributed_optimizer_instances > 1:
-        # Each instance must contain complete CP and GTP model partitions. Dividing only
-        # the dense weight-replica count (DP x CP) could instead split CP, causing the
-        # expert-derived inter-instance group to pair different GTP weight shards.
-        if data_parallel_size % num_distributed_optimizer_instances:
+        # The legacy expert-derived inter-instance group requires whole dense DP
+        # slices. With separate groups, dense peers come from the weight-replica
+        # layout itself; the replica-group divisibility and rank-layout checks below
+        # provide the required partitioning without this additional restriction.
+        if (
+            not separate_dense_expert_inter_instance_groups
+            and data_parallel_size % num_distributed_optimizer_instances
+        ):
             raise ValueError(
                 "GTP with multiple distributed optimizer instances requires the number of "
                 "instances to divide the dense data-parallel size (excluding CP and GTP)"
@@ -996,12 +1044,25 @@ def initialize_model_parallel(
                 "GTP with multiple distributed optimizer instances requires the number of "
                 "instances to divide the expert data-parallel size (excluding ETP, EP, PP, and EGTP)"
             )
-        # Use the dense layout to group one copy of the optimizer state for gradient statistics.
-        optimizer_instance_ids = {}
-        for ranks in weight_replica_rank_sets:
-            local_size = len(ranks) // num_distributed_optimizer_instances
-            for index, peer in enumerate(ranks):
-                optimizer_instance_ids[peer] = index // local_size
+    if num_distributed_optimizer_instances > 1:
+        # Optimizer-wide statistics still use one instance ID per rank. Separate
+        # inter-instance groups only relax the requirement that peers coincide.
+        dense_instance_ids = _validate_optimizer_instance_layouts(
+            weight_replica_rank_sets,
+            expert_decoder_rank_generator.get_ranks("dp"),
+            num_distributed_optimizer_instances,
+            separate_dense_expert_inter_instance_groups,
+        )
+        if gtp_remat_size > 1 or expert_gtp_remat_size > 1:
+            # Every instance must contain complete dense and expert weight shards
+            # so its optimizer-wide statistics cover the full model exactly once.
+            for shard_ranks in weight_rank_generator.get_ranks("gtp_remat"):
+                if len({dense_instance_ids[r] for r in shard_ranks}) != 1:
+                    raise ValueError("GTP weight shards span optimizer instances")
+            for shard_ranks in expert_decoder_rank_generator.get_ranks("gtp_remat"):
+                if len({dense_instance_ids[r] for r in shard_ranks}) != 1:
+                    raise ValueError("Expert GTP weight shards span optimizer instances")
+            optimizer_instance_ids = dense_instance_ids
 
     timeout = timedelta(minutes=distributed_timeout_minutes)
 
@@ -1014,6 +1075,7 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
+    global _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     assert _DATA_PARALLEL_GROUP is None, "data parallel group is already initialized"
 
     num_weight_replicas = len(weight_replica_rank_sets[0])
@@ -1103,6 +1165,20 @@ def initialize_model_parallel(
                     _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = (
                         intra_partial_dp_group_with_cp_gloo
                     )
+            if separate_dense_expert_inter_instance_groups:
+                for local_index in range(intra_partial_data_parallel_size):
+                    inter_ranks = [
+                        ranks_with_cp[i * intra_partial_data_parallel_size + local_index]
+                        for i in range(num_distributed_optimizer_instances)
+                    ]
+                    inter_group = create_group(
+                        inter_ranks,
+                        timeout=timeout,
+                        pg_options=get_nccl_options("inter_dp_cp", nccl_comm_cfgs),
+                        group_desc="INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP",
+                    )
+                    if rank in inter_ranks:
+                        _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = inter_group
         else:
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = _DATA_PARALLEL_GROUP_WITH_CP
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = _DATA_PARALLEL_GROUP_WITH_CP_GLOO
@@ -2702,14 +2778,22 @@ def get_intra_distributed_optimizer_instance_group(check_initialized=True):
 
 
 def get_inter_distributed_optimizer_instance_group(check_initialized=True):
-    """Get the group spanning the different distributed optimizer instances.
-    Attention and MLP/Expert share same inter-instance group, so only built
-    inter_partial_expert_data_parallel_group, and return it at here.
-    """
+    """Get the dense inter-instance group, or the shared legacy expert group."""
+    group = (
+        _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+        if _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP is not None
+        else _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+    )
+    if check_initialized:
+        assert group is not None, "Dense inter distributed optimizer instance group is not initialized"
+    return group
+
+
+def get_inter_expert_distributed_optimizer_instance_group(check_initialized=True):
+    """Get the expert inter-instance group (also shared by dense buckets in legacy mode)."""
     if check_initialized:
         assert _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None, (
-            "Attention and MLP/Expert share same inter distributed optimize instance group, "
-            "which has not been initialized"
+            "Expert inter distributed optimizer instance group is not initialized"
         )
     return _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
 
@@ -2947,6 +3031,8 @@ def destroy_model_parallel():
 
     global _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
+    global _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+    _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
     # End of expert parallelism destroy.
 
     global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP

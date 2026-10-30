@@ -179,6 +179,7 @@ class DistributedDataParallel(_BaseDataParallel):
         # Set inter_dist_opt_group if multiple optimizer instances
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             self.inter_dist_opt_group = process_group_dict['inter_dist_opt_group']
+            self.inter_expt_dist_opt_group = process_group_dict['inter_expt_dist_opt_group']
 
         # Turn off bucketing if we are on a pipeline stage that is not the first (since
         # data-parallel communication on these stages is not on the critical path), or if
@@ -403,12 +404,13 @@ class DistributedDataParallel(_BaseDataParallel):
             assert (
                 self.ddp_config.use_distributed_optimizer
             ), 'Partial DistOpt cannot be used without DistOpt'
-            for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
+            for bucket_groups, inter_group in [
+                (self.bucket_groups, self.inter_dist_opt_group),
+                (self.expert_parallel_bucket_groups, self.inter_expt_dist_opt_group),
+            ]:
                 communication_stream = torch.cuda.Stream(device=torch.cuda.current_device())
                 for bucket_group in bucket_groups:
-                    bucket_group.inter_distributed_optimizer_instance_group = (
-                        self.inter_dist_opt_group
-                    )
+                    bucket_group.inter_distributed_optimizer_instance_group = inter_group
                     bucket_group.communication_stream = communication_stream
 
         # Set `next_param_gather_bucket_group` for different bucket groups by iterating through

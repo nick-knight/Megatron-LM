@@ -27,6 +27,18 @@ def test_inject_gtp_remat_axis():
     assert ps._inject_gtp_remat_axis('tp-dp-pp', after='cp') == 'tp-gtp_remat-dp-pp'
 
 
+def test_separate_inter_instance_layout_validation():
+    dense = [[0, 1, 2, 3]]
+    expert = [[0, 3], [1, 2]]
+    with pytest.raises(ValueError, match="inter-instance peers disagree"):
+        ps._validate_optimizer_instance_layouts(dense, expert, 2, separate=False)
+    assert ps._validate_optimizer_instance_layouts(dense, expert, 2, separate=True) == {
+        0: 0, 1: 0, 2: 1, 3: 1
+    }
+    with pytest.raises(ValueError, match="instance IDs disagree"):
+        ps._validate_optimizer_instance_layouts(dense, [[0, 1], [2, 3]], 2, separate=True)
+
+
 def test_cp_more_local_than_gtp_remat_rank_layout():
     """With cp>1 and gtp_remat>1, CP ranks must have a smaller stride (more local) than
     GTP_remat ranks. Unlike test_inject_gtp_remat_axis, this checks actual rank placement,
@@ -102,7 +114,8 @@ def test_initialize_model_parallel_with_cp_and_gtp_remat():
 
 
 @pytest.mark.parametrize("sequence_shards", [1, 2])
-def test_gtp_optimizer_instances_keep_model_shards_local(sequence_shards):
+@pytest.mark.parametrize("separate_groups", [False, True])
+def test_gtp_optimizer_instances_keep_model_shards_local(sequence_shards, separate_groups):
     """Two instances each contain complete CP, GTP, and EGTP partitions."""
     if world_size != 8:
         pytest.skip("Test requires eight ranks")
@@ -114,6 +127,7 @@ def test_gtp_optimizer_instances_keep_model_shards_local(sequence_shards):
             expert_gtp_remat_size=2,
             gtp_remat_num_sequence_shards=sequence_shards,
             num_distributed_optimizer_instances=2,
+            separate_dense_expert_inter_instance_groups=separate_groups,
         )
 
         def ranks(group):
@@ -123,6 +137,11 @@ def test_gtp_optimizer_instances_keep_model_shards_local(sequence_shards):
         inter_ranks = [rank % 4, rank % 4 + 4]
         assert ranks(ps.get_intra_distributed_optimizer_instance_group()) == instance_ranks
         assert ranks(ps.get_inter_distributed_optimizer_instance_group()) == inter_ranks
+        assert ranks(ps.get_inter_expert_distributed_optimizer_instance_group()) == inter_ranks
+        assert (
+            ps.get_inter_distributed_optimizer_instance_group()
+            is ps.get_inter_expert_distributed_optimizer_instance_group()
+        ) == (not separate_groups)
         dense_partial_group = ps.get_data_parallel_group(
             with_context_parallel=True, with_gtp_remat=True, partial_data_parallel=True
         )
@@ -169,6 +188,53 @@ def test_gtp_optimizer_instances_cannot_split_expert_replica_group():
                 expert_gtp_remat_size=2,
                 num_distributed_optimizer_instances=2,
             )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_separate_inter_groups_allow_gtp_sequence_sharded_dense_dp():
+    """Dense weight replicas can outnumber dense DP when GTP shards sequences."""
+    if world_size != 8:
+        pytest.skip("Test requires eight ranks")
+
+    kwargs = dict(
+        context_parallel_size=4,
+        gtp_remat_size=2,
+        gtp_remat_num_sequence_shards=2,
+        expert_tensor_parallel_size=2,
+        num_distributed_optimizer_instances=4,
+    )
+    try:
+        with pytest.raises(ValueError, match="dense data-parallel size"):
+            Utils.initialize_model_parallel(**kwargs)
+    finally:
+        Utils.destroy_model_parallel()
+
+    try:
+        Utils.initialize_model_parallel(
+            **kwargs, separate_dense_expert_inter_instance_groups=True
+        )
+        dense_inter = ps.get_inter_distributed_optimizer_instance_group()
+        expert_inter = ps.get_inter_expert_distributed_optimizer_instance_group()
+        assert dense_inter is not expert_inter
+        assert dense_inter.size() == expert_inter.size() == 4
+        for group in (dense_inter, expert_inter):
+            value = torch.tensor([rank + 1.0], device="cuda")
+            torch.distributed.all_reduce(value, group=group)
+            expected = sum(
+                peer + 1 for peer in torch.distributed.get_process_group_ranks(group)
+            )
+            assert value.item() == expected
+        assert ps.get_data_parallel_group(
+            with_context_parallel=True, with_gtp_remat=False, partial_data_parallel=True
+        ).size() == 1
+        assert ps.get_expert_data_parallel_group(partial_expert_data_parallel=True).size() == 1
+        instance_ranks = torch.distributed.get_process_group_ranks(
+            ps.get_intra_distributed_optimizer_instance_group()
+        )
+        assert set(torch.distributed.get_process_group_ranks(
+            ps.get_gtp_weight_remat_group()
+        )).issubset(instance_ranks)
     finally:
         Utils.destroy_model_parallel()
 

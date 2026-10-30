@@ -439,6 +439,9 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
                     with_context_parallel=True, partial_data_parallel=True
                 )
                 outer_fsdp_group = parallel_state.get_inter_distributed_optimizer_instance_group()
+                outer_expt_fsdp_group = (
+                    parallel_state.get_inter_expert_distributed_optimizer_instance_group()
+                )
                 hybrid_fsdp_group = parallel_state.get_data_parallel_group(
                     with_context_parallel=True, partial_data_parallel=False
                 )
@@ -454,6 +457,7 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
                     with_context_parallel=True, partial_data_parallel=False
                 )
                 outer_fsdp_group = None
+                outer_expt_fsdp_group = None
                 hybrid_fsdp_group = None
                 expt_dp_group = parallel_state.get_expert_data_parallel_group()
                 ep_group = parallel_state.get_expert_model_parallel_group()
@@ -463,6 +467,9 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
             if enable_hsdp:
                 dp_cp_group = pg_collection.intra_dp_cp
                 outer_fsdp_group = pg_collection.inter_dist_opt
+                outer_expt_fsdp_group = (
+                    pg_collection.inter_expt_dist_opt or pg_collection.inter_dist_opt
+                )
                 hybrid_fsdp_group = pg_collection.dp_cp
                 # This has not been tested yet.
                 expt_dp_group = getattr(pg_collection, 'intra_expt_dp', None)
@@ -471,6 +478,7 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
             else:
                 dp_cp_group = pg_collection.dp_cp
                 outer_fsdp_group = None
+                outer_expt_fsdp_group = None
                 hybrid_fsdp_group = None
                 expt_dp_group = getattr(pg_collection, 'expt_dp', None)
                 ep_group = getattr(pg_collection, 'ep', None)
@@ -492,10 +500,13 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
         if enable_hsdp:
             if self.num_moe_experts is not None:
                 expt_mesh = _get_hsdp_tp_mesh(
-                    outer_fsdp_group, expt_dp_group, expt_tp_group, ep_size=ep_group.size()
+                    outer_expt_fsdp_group,
+                    expt_dp_group,
+                    expt_tp_group,
+                    ep_size=ep_group.size(),
                 )
                 expt_device_mesh = DeviceMesh.from_group(
-                    [outer_fsdp_group, expt_dp_group, expt_tp_group],
+                    [outer_expt_fsdp_group, expt_dp_group, expt_tp_group],
                     device_type="cuda",
                     mesh=expt_mesh.tolist(),
                     mesh_dim_names=["outer_fsdp_dp", "dp_cp", "tp"],
@@ -1074,10 +1085,11 @@ def _build_expert_mesh_and_placements(
     inner_strategy = get_sharding_strategy(ddp_config, is_expert_param=True)
 
     if ddp_config.num_distributed_optimizer_instances > 1:
-        # Match v1 topology: dense and expert parameters share the outer DP axis,
-        # while experts use the existing expert-DP inner group. Only placements differ.
+        # Match v1 topology: experts use their own outer DP peers and expert-DP inner group.
         dp_mesh = _build_hybrid_dp_mesh(
-            pg_collection.inter_dist_opt, pg_collection.intra_expt_dp, device_type
+            pg_collection.inter_expt_dist_opt or pg_collection.inter_dist_opt,
+            pg_collection.intra_expt_dp,
+            device_type,
         )
         inner = _DATA_PARALLEL_PLACEMENTS[inner_strategy]
         outer = _DATA_PARALLEL_PLACEMENTS[ddp_config.expert_outer_dp_sharding_strategy]

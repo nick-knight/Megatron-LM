@@ -61,7 +61,8 @@ class ProcessGroupCollection:
             identical to expt_dp when EGTP_remat_size=1
         intra_dp_cp: Intra partial data parallel group
         intra_expt_dp: Intra partial expert data parallel group
-        inter_dist_opt: Inter distributed optimizer instance group
+        inter_dist_opt: Dense inter distributed optimizer instance group
+        inter_expt_dist_opt: Expert inter distributed optimizer instance group
 
     Example:
         # Create instance and set needed process groups
@@ -179,8 +180,12 @@ class ProcessGroupCollection:
     # _INTRA_EXPERT_DATA_PARALLEL_GROUP
     intra_expt_dp: torch.distributed.ProcessGroup = field(init=False)
 
-    # _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+    # _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP when separate groups are enabled;
+    # otherwise the shared _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP.
     inter_dist_opt: torch.distributed.ProcessGroup = field(init=False)
+
+    # _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP; defaults to inter_dist_opt for older callers.
+    inter_expt_dist_opt: torch.distributed.ProcessGroup = field(init=False)
 
     # _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     intra_dist_opt: torch.distributed.ProcessGroup = field(init=False)
@@ -311,6 +316,10 @@ class ProcessGroupCollection:
             ),
             'inter_dist_opt': partial(
                 parallel_state.get_inter_distributed_optimizer_instance_group,
+                check_initialized=False,
+            ),
+            'inter_expt_dist_opt': partial(
+                parallel_state.get_inter_expert_distributed_optimizer_instance_group,
                 check_initialized=False,
             ),
             'intra_dist_opt': partial(
@@ -637,6 +646,11 @@ class ProcessGroupCollection:
                     if ddp_config.num_distributed_optimizer_instances > 1
                     else None
                 ),
+                'inter_expt_dist_opt_group': (
+                    parallel_state.get_inter_expert_distributed_optimizer_instance_group()
+                    if ddp_config.num_distributed_optimizer_instances > 1
+                    else None
+                ),
                 'intra_dist_opt_group': (
                     parallel_state.get_intra_distributed_optimizer_instance_group()
                     if ddp_config.use_distributed_optimizer
@@ -687,6 +701,7 @@ class ProcessGroupCollection:
                 result['intra_dp_cp_group'] = result['dp_cp_group']
                 result['intra_expt_dp_group'] = result['expt_dp_group']
                 result['inter_dist_opt_group'] = None
+                result['inter_expt_dist_opt_group'] = None
             else:
                 # With multiple optimizer instances, groups must be provided
                 if not (
@@ -702,6 +717,11 @@ class ProcessGroupCollection:
                 result['intra_dp_cp_group'] = pg_collection.intra_dp_cp
                 result['intra_expt_dp_group'] = pg_collection.intra_expt_dp
                 result['inter_dist_opt_group'] = pg_collection.inter_dist_opt
+                result['inter_expt_dist_opt_group'] = (
+                    pg_collection.inter_expt_dist_opt
+                    if 'inter_expt_dist_opt' in pg_set
+                    else pg_collection.inter_dist_opt
+                )
 
             # 5. Model parallel groups (DDP-specific: tp, pp, ep instead of mp, expt_tp_pp)
             if not all(['tp' in pg_set, 'pp' in pg_set, 'ep' in pg_set]):

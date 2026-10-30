@@ -661,7 +661,22 @@ The DP collective only covers the replicate axis; the gtp_remat axis is complete
 
 **Buffer caching.** The per-buffer lists are concatenated once at init into a single flat view for fast iteration in the grad-reduction hot path.
 
-> **Multiple distopt instances with GTP_remat/EGTP_remat.** The instance count must divide the dense DP degree *after* TP, CP, PP, and GTP_remat have been factored out, and the expert DP degree after ETP, EP, PP, and EGTP_remat have been factored out. Each instance then contains complete CP and GTP_remat model partitions. DDP reduces gradient shards within an instance and all-reduces corresponding shards across instances; GTP_remat/EGTP_remat complete their separate reductions as above. Gradient statistics cover every model shard in one instance, excluding the duplicate optimizer copies in other instances. For the built-in rank orders, these divisibility conditions make the dense and expert inter-instance peers coincide.
+> **Multiple distopt instances with GTP_remat/EGTP_remat (legacy shared group).** The instance count must divide the dense DP degree *after* TP, CP, PP, and GTP_remat have been factored out, and the expert DP degree after ETP, EP, PP, and EGTP_remat have been factored out. Each instance then contains complete CP and GTP_remat model partitions. DDP reduces gradient shards within an instance and all-reduces corresponding shards across instances; GTP_remat/EGTP_remat complete their separate reductions as above. Gradient statistics cover every model shard in one instance, excluding the duplicate optimizer copies in other instances. For the built-in rank orders, these divisibility conditions make the dense and expert inter-instance peers coincide.
+
+With `--separate-dense-expert-inter-instance-groups`, dense and expert gradients use
+their own inter-instance communicators. This permits different *ordered peers* for
+the two parameter classes. It also replaces the extra `instances | dense DP` check
+with the actual `instances | dense weight-replica group size` requirement. With GTP
+sequence sharding, that group can be larger than dense DP, so a configuration
+rejected by the legacy check may be valid. Expert DP must still be divisible by
+the instance count. The flag requires more than one optimizer instance; both layouts
+must still assign every rank the same instance ID, since optimizer-wide gradient
+statistics use one shared instance group. CP peers may span optimizer instances in
+these newly permitted layouts, so place such instances within a site if CP traffic
+must remain site-local. Without the flag, both bucket
+classes use the expert-derived inter-instance group as before. The separate dense
+communicator can be configured under `inter_dp_cp` in the NCCL communicator config;
+the expert communicator continues to use `inter_ep_dp`.
 
 ### 3.3 Distributed checkpointing (DCP)
 

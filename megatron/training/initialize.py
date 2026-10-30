@@ -469,6 +469,9 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 min_dynamic_context_parallel_size=args.min_dynamic_context_parallel_size,
                 expert_model_parallel_size=args.expert_model_parallel_size,
                 num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
+                separate_dense_expert_inter_instance_groups=(
+                    args.separate_dense_expert_inter_instance_groups
+                ),
                 expert_tensor_parallel_size=args.expert_tensor_parallel_size,
                 distributed_timeout_minutes=cfg.dist.distributed_timeout_minutes,
                 nccl_communicator_config_path=cfg.dist.nccl_communicator_config_path,
