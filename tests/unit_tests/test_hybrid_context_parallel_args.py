@@ -1,9 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""validate_args must reject CUDA graphs with hybrid (dynamic) context parallelism.
+"""Argument validation for hybrid (dynamic) context parallelism.
 
 A captured graph bakes in static communicators, so it cannot follow the per-microbatch
 context-parallel group that hybrid context parallelism selects at runtime.
+Site placement is unsupported until the runtime domain can be restricted to a site.
 """
 
 import sys
@@ -71,3 +72,26 @@ def test_hybrid_context_parallel_without_cuda_graphs_validates(monkeypatch):
     args = _hybrid_cp_args(monkeypatch)
     validate_args(args)
     assert args.cuda_graph_impl == "none"
+
+
+@pytest.mark.parametrize("mode", ["hybrid_context_parallel", "dynamic_context_parallel"])
+@pytest.mark.parametrize("site_id", [0, 7])
+def test_site_placement_rejects_dynamic_context_parallel_before_grid_setup(
+    monkeypatch, mode, site_id
+):
+    args = _hybrid_cp_args(monkeypatch, hybrid_context_parallel=False, site_id=site_id)
+    setattr(args, mode, True)
+    with pytest.raises(ValueError, match="requires site-restricted domains"):
+        validate_args(args)
+
+
+def test_site_placement_with_static_context_parallel_validates(monkeypatch):
+    args = _hybrid_cp_args(monkeypatch, hybrid_context_parallel=False, site_id=0)
+    validate_args(args)
+    assert args.site_id == 0
+
+
+def test_site_placement_from_defaults_rejects_dynamic_context_parallel(monkeypatch):
+    args = _hybrid_cp_args(monkeypatch)
+    with pytest.raises(ValueError, match="requires site-restricted domains"):
+        validate_args(args, defaults={"site_id": 0})

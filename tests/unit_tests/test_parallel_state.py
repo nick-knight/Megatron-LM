@@ -259,9 +259,7 @@ def test_site_groups_allow_noncontiguous_ranks():
         Utils.destroy_model_parallel()
 
 
-@pytest.mark.parametrize(
-    "axis", ["context", "expert", "dynamic_context", "dynamic_context_full_minimum"]
-)
+@pytest.mark.parametrize("axis", ["context", "expert"])
 def test_site_groups_reject_split_activation_groups(axis):
     if world_size != 8:
         pytest.skip("Test requires eight ranks")
@@ -269,17 +267,33 @@ def test_site_groups_reject_split_activation_groups(axis):
     kwargs = {
         "context": dict(context_parallel_size=2),
         "expert": dict(expert_model_parallel_size=2),
-        "dynamic_context": dict(dynamic_context_parallel=True),
-        "dynamic_context_full_minimum": dict(
-            dynamic_context_parallel=True, min_dynamic_context_parallel_size=8
-        ),
     }[axis]
     try:
         Utils.initialize_model_parallel(**kwargs)
-        site_id = rank // 4 if axis.startswith("dynamic_context") else rank % 2
+        site_id = rank % 2
         pattern = "context-parallel groups" if axis != "expert" else "expert model-parallel groups"
         with pytest.raises(ValueError, match=pattern):
             ps.initialize_site_parallel(site_id)
+        assert ps.get_site_group(check_initialized=False) is None
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("minimum_cp_size", [1, 8])
+@pytest.mark.parametrize("deprecated_alias", [False, True])
+def test_site_groups_reject_dynamic_cp_configuration(minimum_cp_size, deprecated_alias):
+    if world_size != 8:
+        pytest.skip("Test requires eight ranks")
+
+    try:
+        Utils.initialize_model_parallel(
+            hybrid_context_parallel=deprecated_alias,
+            dynamic_context_parallel=not deprecated_alias,
+            min_dynamic_context_parallel_size=minimum_cp_size,
+        )
+        with pytest.raises(ValueError, match="requires site-restricted domains"):
+            # Explicit site placement is unsupported even in a one-site dry run.
+            ps.initialize_site_parallel(0)
         assert ps.get_site_group(check_initialized=False) is None
     finally:
         Utils.destroy_model_parallel()
@@ -302,9 +316,12 @@ def test_site_groups_reject_cp_spanning_complete_optimizer_instances():
         Utils.destroy_model_parallel()
 
 
-def test_site_groups_disabled_when_all_ids_omitted():
+@pytest.mark.parametrize("dynamic_cp", [False, True])
+def test_site_groups_disabled_when_all_ids_omitted(dynamic_cp):
     try:
-        Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
+        Utils.initialize_model_parallel(
+            pipeline_model_parallel_size=2, dynamic_context_parallel=dynamic_cp
+        )
         ps.initialize_site_parallel(None)
         assert ps.get_site_id() is None
         assert ps.get_site_group(check_initialized=False) is None

@@ -131,6 +131,7 @@ _CONTEXT_PARALLEL_GLOBAL_RANKS = None
 _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = None
 # Dynamic context parallel groups, indexed by the runtime CP group size.
 _DYNAMIC_DP_CP_GROUPS = {}
+_DYNAMIC_CONTEXT_PARALLEL_ENABLED = False
 
 # Full data-parallel groups: span every distinct-data rank
 # (size = replicate_DP x gtp_remat). Used for data distribution (batch split, num-microbatches,
@@ -1177,6 +1178,8 @@ def initialize_model_parallel(
             raise ValueError("Cannot set both hybrid_context_parallel and dynamic_context_parallel")
         dynamic_context_parallel = True
 
+    global _DYNAMIC_CONTEXT_PARALLEL_ENABLED
+    _DYNAMIC_CONTEXT_PARALLEL_ENABLED = dynamic_context_parallel
     if dynamic_context_parallel:
         global _DYNAMIC_DP_CP_GROUPS
         for ranks_with_cp in token_rank_generator.get_ranks("dp-cp"):
@@ -1189,12 +1192,6 @@ def initialize_model_parallel(
                     timeout=timeout,
                 )
             )
-
-        # Dynamic CP can use the entire DPxCP domain, even when min_cp_size
-        # excludes all smaller groups. Record this alias as part of the grid.
-        _DYNAMIC_DP_CP_GROUPS[data_parallel_size * context_parallel_size] = (
-            _DATA_PARALLEL_GROUP_WITH_CP
-        )
 
         # NCCL initializes communicators lazily. Touch every local runtime
         # group, including the singleton CP-off group, in a deterministic order.
@@ -2631,6 +2628,8 @@ def initialize_site_parallel(
     nonnegative ID. Sites may contain arbitrary rank sets, provided the constructed
     model, context, and expert parallel groups remain within sites. Distributed
     optimizer sharding groups and instances must also remain within sites when used.
+    Dynamic CP is unsupported with explicit site placement until its scheduling
+    domain can be restricted to a site.
 
     One bootstrap exchange registers IDs and process-group membership. Local set
     comparisons then validate the actual groups without per-axis collectives or
@@ -2664,13 +2663,6 @@ def initialize_site_parallel(
             "context-parallel groups": _CONTEXT_PARALLEL_GROUP,
             "expert model-parallel groups": _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP,
         }
-        if _DYNAMIC_DP_CP_GROUPS:
-            # Dynamic CP slices this DPxCP parent, rather than the static CP
-            # group. The parent itself is selectable, so checking it covers all
-            # candidate subgroups without depending on rank numbering.
-            locality_groups["dynamic context-parallel groups"] = _DYNAMIC_DP_CP_GROUPS[
-                max(_DYNAMIC_DP_CP_GROUPS)
-            ]
         if require_complete_optimizer_instances:
             locality_groups.update(
                 {
@@ -2693,7 +2685,15 @@ def initialize_site_parallel(
     world_size = torch.distributed.get_world_size()
     site_rows = [None] * world_size
     torch.distributed.all_gather_object(
-        site_rows, (site_id, require_complete_optimizer_instances, ready, local, locality_groups)
+        site_rows,
+        (
+            site_id,
+            require_complete_optimizer_instances,
+            ready,
+            local,
+            locality_groups,
+            _DYNAMIC_CONTEXT_PARALLEL_ENABLED,
+        ),
     )
     site_ids = [row[0] for row in site_rows]
     if all(value is None for value in site_ids):
@@ -2706,6 +2706,13 @@ def initialize_site_parallel(
         raise ValueError("Distributed-optimizer placement requirements must match on every rank")
     if not all(row[2] for row in site_rows):
         raise RuntimeError("Site groups require initialized model-parallel groups on every rank")
+    if any(row[5] for row in site_rows):
+        # Direct Core callers can bypass training argument validation. Reject the
+        # unsupported mode explicitly before doing any group-locality validation.
+        raise ValueError(
+            "Site placement with dynamic context parallelism requires site-restricted "
+            "domains, which are not yet supported"
+        )
 
     site_ranks = {
         value: tuple(index for index, rank_site in enumerate(site_ids) if rank_site == value)
@@ -2918,6 +2925,8 @@ def destroy_model_parallel():
 
     global _DYNAMIC_DP_CP_GROUPS
     _DYNAMIC_DP_CP_GROUPS = {}
+    global _DYNAMIC_CONTEXT_PARALLEL_ENABLED
+    _DYNAMIC_CONTEXT_PARALLEL_ENABLED = False
 
     global _EMBEDDING_GROUP
     _EMBEDDING_GROUP = None
