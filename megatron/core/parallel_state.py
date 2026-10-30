@@ -131,6 +131,7 @@ _CONTEXT_PARALLEL_GLOBAL_RANKS = None
 _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = None
 # Dynamic context parallel groups, indexed by the runtime CP group size.
 _DYNAMIC_DP_CP_GROUPS = {}
+_DYNAMIC_CONTEXT_PARALLEL_ENABLED = False
 
 # Full data-parallel groups: span every distinct-data rank
 # (size = replicate_DP x gtp_remat). Used for data distribution (batch split, num-microbatches,
@@ -156,6 +157,14 @@ _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
 
 # Paralel group of all GPUs in a distributed optimizer instance
 _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
+
+# Physical-site placement supplied by the launcher.
+_SITE_ID = None
+_SITE_GROUP = None
+_SITE_GLOBAL_RANKS = None
+_SITE_DATA_PARALLEL_GROUP = None
+_SITE_DATA_PARALLEL_GROUP_WITH_CP = None
+_SITE_EXPERT_DATA_PARALLEL_GROUP = None
 
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
@@ -1169,6 +1178,8 @@ def initialize_model_parallel(
             raise ValueError("Cannot set both hybrid_context_parallel and dynamic_context_parallel")
         dynamic_context_parallel = True
 
+    global _DYNAMIC_CONTEXT_PARALLEL_ENABLED
+    _DYNAMIC_CONTEXT_PARALLEL_ENABLED = dynamic_context_parallel
     if dynamic_context_parallel:
         global _DYNAMIC_DP_CP_GROUPS
         for ranks_with_cp in token_rank_generator.get_ranks("dp-cp"):
@@ -2607,6 +2618,194 @@ def get_intra_distributed_optimizer_instance_group(check_initialized=True):
     return _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
 
 
+def initialize_site_parallel(
+    site_id: Optional[int], *, require_complete_optimizer_instances: bool = False
+) -> None:
+    """Register site-local ranks after model-parallel groups have been created.
+
+    All ranks must call this function, including ranks with ``site_id=None``. If all
+    IDs are None, site placement is disabled. Otherwise every rank must supply a
+    nonnegative ID. Sites may contain arbitrary rank sets, provided the constructed
+    model, context, and expert parallel groups remain within sites. Distributed
+    optimizer sharding groups must also remain within sites when used. Together
+    with the model-parallel axes, these imply locality of each optimizer instance.
+    Dynamic CP is unsupported with explicit site placement until its scheduling
+    domain can be restricted to a site.
+
+    One bootstrap exchange registers IDs and process-group membership. Local set
+    comparisons then validate the actual groups without per-axis collectives or
+    assumptions about rank ordering. All ranks see the same validation errors before
+    constructing site groups, so invalid placement cannot strand peers in new_group.
+    """
+    global _SITE_ID, _SITE_GROUP, _SITE_GLOBAL_RANKS
+    global _SITE_DATA_PARALLEL_GROUP, _SITE_DATA_PARALLEL_GROUP_WITH_CP
+    global _SITE_EXPERT_DATA_PARALLEL_GROUP
+    if _SITE_GROUP is not None:
+        raise RuntimeError("Site process groups are already initialized")
+    if not torch.distributed.is_initialized():
+        raise RuntimeError("Site groups require initialized distributed groups")
+    if torch.distributed.get_backend() == "fake":
+        # Fake process groups simulate peers and cannot exchange placement metadata.
+        if site_id is not None:
+            raise ValueError("Site placement requires a real distributed process group")
+        return
+
+    local = {}
+    locality_groups = {}
+    ready = model_parallel_is_initialized()
+    if site_id is not None and ready:
+        local = {
+            "dp": _DATA_PARALLEL_GROUP_WITH_GTP_REMAT,
+            "dp_cp": _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT,
+            "ep_dp": _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT,
+        }
+        locality_groups = {
+            "model-parallel replicas": _MODEL_PARALLEL_GROUP,
+            "context-parallel groups": _CONTEXT_PARALLEL_GROUP,
+            "expert model-parallel groups": _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP,
+        }
+        if require_complete_optimizer_instances:
+            # Check the groups carrying gradient and parameter shards. Each class's
+            # aggregate statistics group is the connected union of its model-parallel
+            # axes and intra-instance sharding groups, so its locality is implied.
+            # This also holds when dense and expert instance assignments differ.
+            locality_groups.update(
+                {
+                    "dense optimizer sharding groups": _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP,
+                    "expert optimizer sharding groups": _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP,
+                }
+            )
+
+        def group_ranks(group):
+            return (
+                tuple(torch.distributed.get_process_group_ranks(group))
+                if group is not None
+                else None
+            )
+
+        local = {kind: group_ranks(group) for kind, group in local.items()}
+        locality_groups = {kind: group_ranks(group) for kind, group in locality_groups.items()}
+
+    world_size = torch.distributed.get_world_size()
+    site_rows = [None] * world_size
+    torch.distributed.all_gather_object(
+        site_rows,
+        (
+            site_id,
+            require_complete_optimizer_instances,
+            ready,
+            local,
+            locality_groups,
+            _DYNAMIC_CONTEXT_PARALLEL_ENABLED,
+        ),
+    )
+    site_ids = [row[0] for row in site_rows]
+    if all(value is None for value in site_ids):
+        return
+    if any(value is None for value in site_ids):
+        raise ValueError("site_id must be supplied on every rank or omitted on every rank")
+    if any(type(value) is not int or value < 0 for value in site_ids):
+        raise ValueError("site_id must be a nonnegative integer on every rank")
+    if any(row[1] != require_complete_optimizer_instances for row in site_rows):
+        raise ValueError("Distributed-optimizer placement requirements must match on every rank")
+    if not all(row[2] for row in site_rows):
+        raise RuntimeError("Site groups require initialized model-parallel groups on every rank")
+    if any(row[5] for row in site_rows):
+        # Direct Core callers can bypass training argument validation. Reject the
+        # unsupported mode explicitly before doing any group-locality validation.
+        raise ValueError(
+            "Site placement with dynamic context parallelism requires site-restricted "
+            "domains, which are not yet supported"
+        )
+
+    site_ranks = {
+        value: tuple(index for index, rank_site in enumerate(site_ids) if rank_site == value)
+        for value in sorted(set(site_ids))
+    }
+    site_rank_sets = {value: set(ranks) for value, ranks in site_ranks.items()}
+    # Locality and optimizer-layout validity are separate invariants. Keep the
+    # independent checks in initialize_model_parallel even if some are implied here.
+    for peer, row in enumerate(site_rows):
+        for name, peers in row[4].items():
+            if peers is None:
+                raise RuntimeError(f"{name} are not initialized on rank {peer}")
+            if not set(peers).issubset(site_rank_sets[site_ids[peer]]):
+                raise ValueError(
+                    f"Each site must contain complete {name}; rank {peer}'s group {peers} "
+                    f"crosses sites {sorted({site_ids[member] for member in peers})}"
+                )
+        if any(peers is None for peers in row[3].values()):
+            raise RuntimeError(f"Data-parallel groups are not initialized on rank {peer}")
+
+    rank = torch.distributed.get_rank()
+
+    groups = {}
+    for value, ranks in site_ranks.items():
+        group = create_group(list(ranks), group_desc="SITE_GROUP")
+        groups[ranks] = group
+        if rank in ranks:
+            _SITE_ID = value
+            _SITE_GROUP = group
+            _SITE_GLOBAL_RANKS = ranks
+
+    local_parallel_rank_sets = set()
+    for peer, row in enumerate(site_rows):
+        peer_groups = row[3]
+        for ranks in peer_groups.values():
+            local_parallel_rank_sets.add(
+                tuple(sorted(member for member in ranks if site_ids[member] == site_ids[peer]))
+            )
+    for ranks in sorted(local_parallel_rank_sets):
+        if ranks not in groups:
+            groups[ranks] = create_group(list(ranks), group_desc="SITE_PARALLEL_GROUP")
+
+    def local_group(kind):
+        ranks = tuple(sorted(peer for peer in local[kind] if site_ids[peer] == site_id))
+        return groups[ranks]
+
+    _SITE_DATA_PARALLEL_GROUP = local_group("dp")
+    _SITE_DATA_PARALLEL_GROUP_WITH_CP = local_group("dp_cp")
+    _SITE_EXPERT_DATA_PARALLEL_GROUP = local_group("ep_dp")
+
+
+def get_site_id() -> Optional[int]:
+    """Return this rank's site ID, or None if no site placement was provided."""
+    return _SITE_ID
+
+
+def get_site_group(check_initialized: bool = True):
+    """Return the process group containing this rank's physical site."""
+    if check_initialized:
+        assert _SITE_GROUP is not None, "Site group is not initialized"
+    return _SITE_GROUP
+
+
+def get_site_global_ranks() -> Optional[tuple[int, ...]]:
+    """Return the ordered global ranks at this site, if configured."""
+    return _SITE_GLOBAL_RANKS
+
+
+def get_site_data_parallel_group(with_context_parallel: bool = False, check_initialized: bool = True):
+    """Return the intersection of this site and the dense DP or DP+CP group."""
+    group = (
+        _SITE_DATA_PARALLEL_GROUP_WITH_CP
+        if with_context_parallel
+        else _SITE_DATA_PARALLEL_GROUP
+    )
+    if check_initialized:
+        assert group is not None, "Site data-parallel group is not initialized"
+    return group
+
+
+def get_site_expert_data_parallel_group(check_initialized: bool = True):
+    """Return the intersection of this site and the expert-DP group."""
+    if check_initialized:
+        assert _SITE_EXPERT_DATA_PARALLEL_GROUP is not None, (
+            "Site expert data-parallel group is not initialized"
+        )
+    return _SITE_EXPERT_DATA_PARALLEL_GROUP
+
+
 def get_inter_distributed_optimizer_instance_group(check_initialized=True):
     """Get the group spanning the different distributed optimizer instances.
     Attention and MLP/Expert share same inter-instance group, so only built
@@ -2683,6 +2882,16 @@ def destroy_model_parallel():
     global _MODEL_PARALLEL_GROUP
     _MODEL_PARALLEL_GROUP = None
 
+    global _SITE_ID, _SITE_GROUP, _SITE_GLOBAL_RANKS
+    global _SITE_DATA_PARALLEL_GROUP, _SITE_DATA_PARALLEL_GROUP_WITH_CP
+    global _SITE_EXPERT_DATA_PARALLEL_GROUP
+    _SITE_ID = None
+    _SITE_GROUP = None
+    _SITE_GLOBAL_RANKS = None
+    _SITE_DATA_PARALLEL_GROUP = None
+    _SITE_DATA_PARALLEL_GROUP_WITH_CP = None
+    _SITE_EXPERT_DATA_PARALLEL_GROUP = None
+
     global _TENSOR_MODEL_PARALLEL_GROUP
     _TENSOR_MODEL_PARALLEL_GROUP = None
 
@@ -2720,6 +2929,8 @@ def destroy_model_parallel():
 
     global _DYNAMIC_DP_CP_GROUPS
     _DYNAMIC_DP_CP_GROUPS = {}
+    global _DYNAMIC_CONTEXT_PARALLEL_ENABLED
+    _DYNAMIC_CONTEXT_PARALLEL_ENABLED = False
 
     global _EMBEDDING_GROUP
     _EMBEDDING_GROUP = None

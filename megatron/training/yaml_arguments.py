@@ -113,6 +113,23 @@ def validate_yaml(args, defaults={}):
         else:
             setattr(args, key, defaults[key])
 
+    # Check both legacy top-level options and nested model-parallel settings.
+    site_id = getattr(args, 'site_id', None)
+    if site_id is not None and (type(site_id) is not int or site_id < 0):
+        raise ValueError('--site-id must be a nonnegative integer')
+    if site_id is not None and any(
+        getattr(config, flag, False)
+        for config in (args, args.model_parallel)
+        for flag in ('dynamic_context_parallel', 'hybrid_context_parallel')
+    ):
+        # The site count is not known yet. Treat any explicit --site-id as opting
+        # into site placement; dynamic CP currently schedules over global DPxCP.
+        raise ValueError(
+            '--site-id cannot be combined with dynamic context parallelism '
+            '(including --hybrid-context-parallel): dynamic context parallelism '
+            'requires site-restricted domains, which are not yet supported'
+        )
+
     # Batch size.
     assert args.micro_batch_size is not None
     assert args.micro_batch_size > 0

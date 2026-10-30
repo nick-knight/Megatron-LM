@@ -54,6 +54,22 @@ def _runtime_args():
     )
 
 
+@pytest.mark.parametrize("yaml_cfg", [None, "model.yaml"])
+def test_site_args_use_cli_and_yaml_validation_paths(monkeypatch, yaml_cfg):
+    args = Namespace(
+        use_checkpoint_args=False, yaml_cfg=yaml_cfg, site_id=0, dynamic_context_parallel=True
+    )
+    monkeypatch.setattr(arguments, "parse_args", Mock(return_value=args))
+    validator = Mock(side_effect=RuntimeError("shared argument validator"))
+    if yaml_cfg is None:
+        monkeypatch.setattr(arguments, "validate_args", validator)
+    else:
+        monkeypatch.setattr("megatron.training.yaml_arguments.validate_yaml", validator)
+    with pytest.raises(RuntimeError, match="shared argument validator"):
+        arguments.parse_and_validate_args()
+    validator.assert_called_once_with(args, {})
+
+
 @pytest.mark.parametrize("adapter", [gpt_config_from_args, hybrid_config_from_args])
 @pytest.mark.parametrize(
     "overrides", [None, "overlap.yaml", {"qkv_fprop": {"method": "ring_exchange"}}]

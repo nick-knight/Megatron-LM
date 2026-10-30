@@ -148,6 +148,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
 
     # Experimental yaml
     if args.yaml_cfg is not None:
+        cli_site_id = args.site_id
         cli_policy = _default_config_from_args(AutotunePolicy, args, prefix='triton_autotune')
         if cli_policy != AutotunePolicy():
             raise ValueError(
@@ -162,6 +163,11 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
         from .yaml_arguments import load_yaml
 
         args = load_yaml(args.yaml_cfg)
+        # Placement comes from the launcher even when model settings come from YAML.
+        if cli_site_id is not None:
+            args.site_id = cli_site_id
+        elif not hasattr(args, 'site_id'):
+            args.site_id = None
 
 
     # Args from environment
@@ -604,6 +610,22 @@ def validate_args(args, defaults={}):
                                                  v2=getattr(args, key)))
         else:
             setattr(args, key, defaults[key])
+
+    # Site placement is optional and must be checked after applying defaults.
+    site_id = getattr(args, 'site_id', None)
+    if site_id is not None and (type(site_id) is not int or site_id < 0):
+        raise ValueError('--site-id must be a nonnegative integer')
+    if site_id is not None and (
+        getattr(args, 'dynamic_context_parallel', False)
+        or getattr(args, 'hybrid_context_parallel', False)
+    ):
+        # The site count is not known yet. Treat any explicit --site-id as opting
+        # into site placement; dynamic CP currently schedules over global DPxCP.
+        raise ValueError(
+            '--site-id cannot be combined with dynamic context parallelism '
+            '(including --hybrid-context-parallel): dynamic context parallelism '
+            'requires site-restricted domains, which are not yet supported'
+        )
 
     if args.data_path is not None and args.split is None:
         legacy_default_split_value = '969, 30, 1'
@@ -3154,6 +3176,13 @@ def _add_distributed_args(parser):
                        help='If set, enable full sharding in megatron-fsdp Hybrid Sharded Data Parallel (HSDP) mode.')
     group.add_argument('--num-distributed-optimizer-instances', type=int, default=1,
                        help='Number of Distributed Optimizer copies across Data Parallel domain.')
+    group.add_argument('--site-id', type=int, default=None,
+                       help='Physical-site ID supplied by the launcher. All ranks at a site '
+                            'must share an ID. Supply it on every rank or omit it everywhere. '
+                            'Constructed model, context, and expert parallel groups must stay '
+                            'within sites; optimizer instances and sharding groups must also '
+                            'stay within sites when used. Site ranks need not be contiguous. '
+                            'Dynamic (hybrid) context parallelism is not yet supported.')
     group.add_argument('--torch-fsdp2-no-reshard-after-forward', action='store_false', dest='torch_fsdp2_reshard_after_forward',
                        help='Whether to reshard weights after forward pass when using PyTorch FSDP2. '
                        'Set to enable FSDP ZeRO-2.')
