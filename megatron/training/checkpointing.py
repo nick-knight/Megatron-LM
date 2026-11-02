@@ -696,6 +696,45 @@ def _default_site_checkpoint_groups(args, checkpoint_group, parallelization_grou
     return site_group, parallelization_group
 
 
+def _validate_fsdp_dtensor_checkpoint_domain(state_dict, checkpoint_group):
+    """Require a domain to contain complete DTensor shards before native DCP saves.
+
+    Replicated mesh axes may cross domains. Sharded axes must be contained in a
+    domain, including optimizer slots: outer-sharded HFSDP cannot produce a
+    complete checkpoint on an individual site's filesystem.
+    """
+    if checkpoint_group is None:
+        return
+    from torch.distributed.tensor import DTensor
+
+    domain_ranks = set(torch.distributed.get_process_group_ranks(checkpoint_group))
+    invalid = False
+
+    def check_sharded_axes(value):
+        nonlocal invalid
+        if isinstance(value, DTensor):
+            for axis, placement in enumerate(value.placements):
+                if placement.is_partial():
+                    invalid = True
+                elif placement.is_shard():
+                    peers = torch.distributed.get_process_group_ranks(value.device_mesh.get_group(axis))
+                    invalid |= not domain_ranks.issuperset(peers)
+        return value
+
+    dict_list_map_inplace(check_sharded_axes, state_dict)
+    # A PP stage or expert may expose a violating tensor only on some ranks.
+    # Reject collectively within the domain before its peers enter DCP planning.
+    device = 'cuda' if torch.distributed.get_backend(checkpoint_group) == 'nccl' else 'cpu'
+    invalid_flag = torch.tensor(int(invalid), device=device)
+    torch.distributed.all_reduce(invalid_flag, op=torch.distributed.ReduceOp.MAX, group=checkpoint_group)
+    if invalid_flag.item():
+        raise ValueError(
+            'fsdp_dtensor checkpoint_group must contain complete shards of every tensor; '
+            'sharded mesh axes must stay within the checkpoint domain. Use a replicated '
+            'outer optimizer axis for site-local HSDP checkpoints.'
+        )
+
+
 def _validate_site_resume_agreement(checkpoint_group, phase, state):
     """Check that independently stored site checkpoints describe one training step.
 
@@ -1093,6 +1132,7 @@ def save_checkpoint(
                 ensure_directory_exists(checkpoint_name, check_parent=False)
 
             if ckpt_format == 'fsdp_dtensor':
+                _validate_fsdp_dtensor_checkpoint_domain(state_dict, checkpoint_group)
                 state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
 
             if args.async_save:
@@ -2304,12 +2344,14 @@ def _get_checkpoint_format(checkpoint_name, args):
     ckpt_format = None
     if dist_checkpointing.check_is_distributed_checkpoint(checkpoint_name):
         ckpt_format = 'torch_dist'
-    elif is_torch_ckpt:
-        ckpt_format = 'torch'
     elif is_torch_dcp:
+        # Native DCP checkpoints may also contain mp_rank_* directories for
+        # dataloader state. Their .metadata file identifies the tensor format.
         ckpt_format = 'torch_dcp'
         if getattr(args, 'use_megatron_fsdp', False):
             ckpt_format = 'fsdp_dtensor'
+    elif is_torch_ckpt:
+        ckpt_format = 'torch'
     else:
         raise NotImplementedError(f'unknown checkpoint format in {checkpoint_name}')
 
@@ -3276,6 +3318,9 @@ def load_checkpoint(
             sharded_state_dict['opt_param_scheduler'] = opt_param_scheduler.state_dict()
         load_kwargs['sharded_state_dict'] = sharded_state_dict
     elif args.ckpt_format == 'fsdp_dtensor':
+        if tp_group is None and pp_group is None:
+            tp_group = mpu.get_tensor_model_parallel_group()
+            pp_group = mpu.get_pipeline_model_parallel_group()
         # Use the selected checkpoint, including a non-persistent checkpoint or
         # an alternate load_arg, without re-reading a tracker with WORLD collectives.
         reader = FileSystemReader(checkpoint_name)
