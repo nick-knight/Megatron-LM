@@ -1,16 +1,25 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # Note: --ckpt-format torch_dist has tests in tests/unit_tests/dist_checkpointing.
 import os
+import random
+import shutil
+import time
 from dataclasses import fields
 from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
 
+import numpy as np
 import pytest
 import torch
+import torch.distributed as dist
 import torch.distributed.checkpoint
 import yaml
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor, Replicate, Shard
 
+from megatron.core import parallel_state as ps
+from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.models.gpt import GPTModel
@@ -20,7 +29,10 @@ from megatron.core.num_microbatches_calculator import (
     unset_num_microbatches_calculator,
 )
 from megatron.core.rerun_state_machine import RerunMode, RerunState, RerunStateMachine
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import (
+    get_cuda_rng_tracker,
+    model_parallel_cuda_manual_seed,
+)
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
@@ -46,6 +58,140 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 pytestmark = pytest.mark.usefixtures("run_config")
+
+
+@pytest.mark.parametrize("mismatch", ["none", "sites", "within_site"])
+def test_site_resume_agreement(mismatch):
+    from megatron.training import checkpointing
+
+    Utils.initialize_distributed()
+    if Utils.world_size < 4 or Utils.world_size % 2:
+        pytest.skip("Requires two equal checkpoint domains")
+    group_size = Utils.world_size // 2
+    groups = [
+        dist.new_group(ranks=list(range(start, start + group_size))) for start in (0, group_size)
+    ]
+    group = groups[Utils.rank // group_size]
+    iteration = 3
+    if mismatch == "sites" and Utils.rank >= group_size:
+        iteration = 7
+    elif mismatch == "within_site" and Utils.rank == 1:
+        iteration = 7
+
+    if mismatch == "none":
+        checkpointing._validate_site_resume_agreement(group, "selection", (iteration, False))
+    else:
+        with pytest.raises(RuntimeError, match="use --ckpt-step"):
+            checkpointing._validate_site_resume_agreement(group, "selection", (iteration, False))
+
+
+def test_site_load_detects_format_mismatch_before_loading(create_ckpt_load_args, monkeypatch):
+    from megatron.training import checkpointing
+
+    Utils.initialize_distributed()
+    if Utils.world_size < 4 or Utils.world_size % 2:
+        pytest.skip("Requires two equal checkpoint domains")
+    group_size = Utils.world_size // 2
+    groups = [
+        dist.new_group(ranks=list(range(start, start + group_size))) for start in (0, group_size)
+    ]
+    group = groups[Utils.rank // group_size]
+    args = create_ckpt_load_args
+    args.load = "unused"
+    args.ckpt_format = "torch_dist"
+    args.auto_detect_ckpt_format = True
+    monkeypatch.setattr(checkpointing, "get_args", lambda: args)
+    monkeypatch.setattr(
+        checkpointing, "_default_site_checkpoint_groups", lambda *a, **kw: (group, None)
+    )
+    ckpt_type = CheckpointType.GLOBAL if Utils.rank < group_size else CheckpointType.LEGACY
+    monkeypatch.setattr(
+        checkpointing,
+        "_load_base_checkpoint",
+        mock.Mock(return_value=({}, "unused", False, ckpt_type)),
+    )
+
+    with pytest.raises(RuntimeError, match="same checkpoint format and iteration"):
+        load_checkpoint([], None, None)
+
+
+@pytest.mark.parametrize("requested_step", [0, 100])
+def test_ckpt_step_overrides_newer_nonpersistent_checkpoint(monkeypatch, requested_step):
+    from megatron.training import checkpointing
+
+    args = SimpleNamespace(
+        non_persistent_global_ckpt_dir=None,
+        non_persistent_ckpt_type="global",
+        ckpt_step=requested_step,
+        exit_on_missing_checkpoint=True,
+    )
+    monkeypatch.setattr(checkpointing, "_get_non_persistent_iteration", lambda *a, **kw: 101)
+    monkeypatch.setattr(checkpointing, "file_exists", lambda *a: False)
+    monkeypatch.setattr(checkpointing.maybe_msc.os.path, "isfile", lambda *a: True)
+    monkeypatch.setattr(checkpointing, "read_metadata", lambda *a, **kw: (100, False))
+    monkeypatch.setattr(checkpointing, "_get_checkpoint_format", lambda *a: "torch_dist")
+    persistent_load = mock.Mock(return_value=({}, "checkpoint", False, CheckpointType.GLOBAL))
+    nonpersistent_load = mock.Mock()
+    monkeypatch.setattr(checkpointing, "_load_global_dist_base_checkpoint", persistent_load)
+    monkeypatch.setattr(checkpointing, "_load_non_persistent_base_checkpoint", nonpersistent_load)
+    loaded_iteration = mock.Mock()
+    monkeypatch.setattr(checkpointing, "set_loaded_iteration", loaded_iteration)
+
+    checkpointing._load_base_checkpoint("checkpoint_root", args, rank0=True)
+    persistent_load.assert_called_once()
+    nonpersistent_load.assert_not_called()
+    loaded_iteration.assert_called_once_with(requested_step)
+
+
+@pytest.mark.parametrize("ckpt_format", ["torch", "torch_dcp"])
+@pytest.mark.parametrize("loading", [False, True])
+def test_site_checkpoint_rejects_unsupported_format(monkeypatch, ckpt_format, loading):
+    from megatron.training import checkpointing
+
+    monkeypatch.setattr(checkpointing.mpu, "get_site_group", lambda **_: object())
+    args = SimpleNamespace(ckpt_format=ckpt_format, auto_detect_ckpt_format=True)
+    with pytest.raises(
+        ValueError,
+        match="--site-id checkpointing requires --ckpt-format torch_dist or fsdp_dtensor",
+    ):
+        checkpointing._default_site_checkpoint_groups(args, None, None, loading=loading)
+
+
+@pytest.mark.parametrize("loading", [False, True])
+def test_fsdp_dtensor_site_checkpoint_uses_native_dcp(monkeypatch, loading):
+    from megatron.training import checkpointing
+
+    site_group = object()
+    monkeypatch.setattr(checkpointing.mpu, "get_site_group", lambda **_: site_group)
+    args = SimpleNamespace(ckpt_format="fsdp_dtensor")
+    assert checkpointing._default_site_checkpoint_groups(args, None, None, loading=loading) == (
+        site_group,
+        None,
+    )
+
+
+def test_site_checkpoint_selects_local_parallelization_group(monkeypatch):
+    from megatron.training import checkpointing
+
+    site_group, dp_group, expert_group = object(), object(), object()
+    monkeypatch.setattr(checkpointing.mpu, "get_site_group", lambda **_: site_group)
+    monkeypatch.setattr(checkpointing.mpu, "get_site_data_parallel_group", lambda **_: dp_group)
+    monkeypatch.setattr(
+        checkpointing.mpu, "get_site_expert_data_parallel_group", lambda: expert_group
+    )
+    args = SimpleNamespace(
+        ckpt_format="torch_dist",
+        ckpt_fully_parallel_save_process_group="dp",
+        ckpt_fully_parallel_load_process_group="ep_dp",
+    )
+    assert checkpointing._default_site_checkpoint_groups(args, None, None, loading=False) == (
+        site_group,
+        dp_group,
+    )
+    assert checkpointing._default_site_checkpoint_groups(args, None, None, loading=True) == (
+        site_group,
+        expert_group,
+    )
 
 
 @pytest.mark.parametrize("ckpt_args", [None, SimpleNamespace()])
@@ -264,6 +410,60 @@ def test_maybe_save_dataloader_state_rank_independent_writes_one_file(tmp_path, 
     else:
         assert saved == []
         assert save_state_calls == []
+
+
+@pytest.mark.parametrize("global_rank", [2, 3])
+def test_maybe_save_dataloader_state_uses_site_leader_for_shared_state(tmp_path, global_rank):
+    """A rank-independent loader writes one local file even when the site excludes global DP0."""
+    model_group = SimpleNamespace(rank=0, size=1)
+    data_group = SimpleNamespace(rank=global_rank, size=4)
+    site_group = object()
+    iterator = SimpleNamespace(
+        iterable=SimpleNamespace(
+            save_state=mock.Mock(return_value={"position": 16}), is_save_state_rank_independent=True
+        )
+    )
+
+    with (
+        mock.patch(
+            "megatron.training.checkpointing.get_pg_rank", side_effect=lambda group: group.rank
+        ),
+        mock.patch(
+            "megatron.training.checkpointing.get_pg_size", side_effect=lambda group: group.size
+        ),
+        mock.patch(
+            "megatron.training.checkpointing.mpu.get_context_parallel_group", return_value=None
+        ),
+        mock.patch(
+            "megatron.training.checkpointing.torch.distributed.get_process_group_ranks",
+            side_effect=lambda group: [2, 3] if group is site_group else [0, 1, 2, 3],
+        ),
+        mock.patch(
+            "megatron.training.checkpointing.torch.distributed.get_rank", return_value=global_rank
+        ),
+        mock.patch("megatron.training.checkpointing.torch.distributed.barrier") as barrier,
+        mock.patch("megatron.training.checkpointing.torch.save") as save,
+    ):
+        maybe_save_dataloader_state(
+            iterator,
+            2,
+            tmp_path,
+            tp_group=model_group,
+            pp_group=model_group,
+            dp_group=data_group,
+            checkpoint_group=site_group,
+        )
+
+    barrier.assert_not_called()
+    if global_rank == 2:
+        iterator.iterable.save_state.assert_called_once_with()
+        save.assert_called_once_with(
+            {"dataloader_state_dict": {"position": 16}},
+            str(tmp_path / "iter_0000002" / "mp_rank_00" / "train_dataloader_dprank000.pt"),
+        )
+    else:
+        iterator.iterable.save_state.assert_not_called()
+        save.assert_not_called()
 
 
 def test_maybe_save_dataloader_state_skips_empty_state_after_barriers(tmp_path):
@@ -825,6 +1025,303 @@ def test_save_checkpoint(
             assert saved_config["profiling"][field.name] == getattr(profiling, field.name)
         assert args.profile is False and args.profile_ranks == [99]
         assert args.memory_snapshot_path == "stale.pickle"
+
+
+@pytest.mark.parametrize("fully_parallel", [False, True])
+@pytest.mark.parametrize("automatic_site_id", [False, True])
+def test_independent_training_checkpoint_domains(
+    init_model_parallel,
+    create_ckpt_load_args,
+    tmp_path_dist_ckpt,
+    run_config,
+    fully_parallel,
+    automatic_site_id,
+):
+    """Each site can save and resume its own iteration and per-rank RNG state."""
+    if Utils.world_size < 4 or Utils.world_size % 2:
+        pytest.skip("Requires an even world size of at least four ranks")
+
+    group_size = Utils.world_size // 2
+    domain_id = Utils.rank // group_size
+    if automatic_site_id:
+        Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=2)
+        ps.initialize_site_parallel(domain_id, require_complete_optimizer_instances=True)
+    groups = [
+        dist.new_group(ranks=list(range(start, start + group_size))) for start in (0, group_size)
+    ]
+    group = groups[domain_id]
+    local_rank = dist.get_rank(group=group)
+    first_done = tmp_path_dist_ckpt / f"training_domain_first_done_{fully_parallel}"
+    second_done = tmp_path_dist_ckpt / f"training_domain_second_done_{fully_parallel}"
+    if Utils.rank == 0:
+        first_done.unlink(missing_ok=True)
+        second_done.unlink(missing_ok=True)
+    dist.barrier()
+
+    def wait_for(path):
+        deadline = time.monotonic() + 60
+        while not path.exists():
+            if time.monotonic() > deadline:
+                pytest.fail(f"Checkpoint domain did not finish independently: {path.name}")
+            time.sleep(0.1)
+
+    if domain_id == 1:
+        wait_for(first_done)
+
+    checkpoint_dir = tmp_path_dist_ckpt / f"training_domain_{fully_parallel}_{domain_id}"
+    if local_rank == 0:
+        shutil.rmtree(checkpoint_dir, ignore_errors=True)
+        checkpoint_dir.mkdir(parents=True)
+    dist.barrier(group=group)
+
+    args = create_ckpt_load_args
+    args.ckpt_format = "torch_dist"
+    args.use_dist_ckpt = True
+    args.use_distributed_optimizer = False
+    args.no_save_optim = True
+    args.no_load_optim = True
+    args.fp16 = False
+    args.bf16 = False
+    args.ckpt_fully_parallel_save = fully_parallel
+    args.ckpt_fully_parallel_load = fully_parallel
+    args.ckpt_fully_parallel_save_process_group = "dp"
+    args.ckpt_fully_parallel_load_process_group = "dp"
+    args.ckpt_fully_parallel_load_exchange_algo = "broadcast"
+    args.world_size = Utils.world_size
+    args.data_parallel_size = Utils.world_size
+    args.save = checkpoint_dir
+    args.load = checkpoint_dir
+    args.dataloader_save = checkpoint_dir
+    args.save_tokenizer_assets = False
+    args.site_id = domain_id if automatic_site_id else None
+    set_args(args)
+    run_config.rng.data_parallel_random_init = True
+
+    class DomainModel(MockModel):
+        def sharded_state_dict(self, *args, **kwargs):
+            return {
+                key: ShardedTensor.from_rank_offsets(key, value, replica_id=Utils.rank)
+                for key, value in self.state_dict().items()
+            }
+
+    config = TransformerConfig(num_layers=1, kv_channels=1)
+    model = DomainModel(config).cuda()
+    for parameter in model.parameters():
+        parameter.data.fill_(domain_id + 1)
+    torch.manual_seed(1000 + Utils.rank)
+    expected_rng = torch.get_rng_state().clone()
+    iteration = 3 if domain_id == 0 else 7
+    data_iterator = SimpleNamespace(
+        iterable=SimpleNamespace(save_state=lambda: {"rank": Utils.rank, "iteration": iteration})
+    )
+    save_checkpoint(
+        iteration,
+        [model],
+        None,
+        None,
+        17,
+        train_data_iterator=data_iterator,
+        checkpoint_group=None if automatic_site_id else group,
+        checkpoint_parallelization_group=(
+            None if automatic_site_id else group if fully_parallel else None
+        ),
+    )
+    assert (checkpoint_dir / "latest_checkpointed_iteration.txt").read_text() == str(iteration)
+    dataloader_file = (
+        checkpoint_dir
+        / f"iter_{iteration:07d}"
+        / "mp_rank_00"
+        / f"train_dataloader_dprank{Utils.rank:03d}.pt"
+    )
+    assert torch.load(dataloader_file, weights_only=False)["dataloader_state_dict"] == {
+        "rank": Utils.rank,
+        "iteration": iteration,
+    }
+
+    if local_rank == 0:
+        (first_done if domain_id == 0 else second_done).touch()
+    if domain_id == 0:
+        wait_for(second_done)
+
+    restored = DomainModel(config).cuda()
+    for parameter in restored.parameters():
+        parameter.data.zero_()
+    torch.manual_seed(2000 + Utils.rank)
+    assert load_checkpoint(
+        [restored],
+        None,
+        None,
+        checkpoint_group=None if automatic_site_id else group,
+        checkpoint_parallelization_group=(
+            None if automatic_site_id else group if fully_parallel else None
+        ),
+    ) == (iteration, 17)
+    for actual in restored.parameters():
+        torch.testing.assert_close(actual, torch.full_like(actual, domain_id + 1))
+    assert torch.equal(torch.get_rng_state(), expected_rng)
+
+
+@pytest.mark.parametrize("automatic_site_id", [False, True])
+@pytest.mark.parametrize("non_persistent", [False, True])
+@pytest.mark.parametrize("cp_size", [1, 2])
+@pytest.mark.parametrize("owned_rng", [False, True])
+def test_fsdp_dtensor_site_training_checkpoint(
+    init_model_parallel,
+    create_ckpt_load_args,
+    tmp_path_dist_ckpt,
+    run_config,
+    automatic_site_id,
+    non_persistent,
+    cp_size,
+    owned_rng,
+):
+    """Native DCP preserves site-local shards, training progress and every rank's RNG."""
+    from megatron.training.global_vars import get_train_state
+
+    if Utils.world_size < 4 or Utils.world_size % 4:
+        pytest.skip("Requires a world size divisible by four")
+    Utils.initialize_model_parallel(
+        1, 1, context_parallel_size=cp_size, num_distributed_optimizer_instances=2
+    )
+    group_size = Utils.world_size // 2
+    site_id = Utils.rank // group_size
+    if automatic_site_id:
+        ps.initialize_site_parallel(site_id, require_complete_optimizer_instances=True)
+    site_groups = [
+        dist.new_group(list(range(start, start + group_size))) for start in (0, group_size)
+    ]
+    site_group = site_groups[site_id]
+    mesh = init_device_mesh("cuda", (2, group_size), mesh_dim_names=("replica", "shard"))
+    args = create_ckpt_load_args
+    args.ckpt_format = "fsdp_dtensor"
+    args.use_megatron_fsdp = True
+    args.use_dist_ckpt = True
+    args.use_distributed_optimizer = False
+    args.fp16 = args.bf16 = False
+    args.swiglu = False
+    args.num_experts = None
+    args.world_size = Utils.world_size
+    args.data_parallel_size = Utils.world_size // cp_size
+    args.context_parallel_size = cp_size
+    args.save_tokenizer_assets = False
+    args.non_persistent_ckpt_type = "global" if non_persistent else None
+    args.save = args.load = tmp_path_dist_ckpt / f"native_site_{site_id}"
+    args.non_persistent_global_ckpt_dir = args.save / "nonpersistent"
+    args.dataloader_save = args.save
+    set_args(args)
+    run_config.rng.data_parallel_random_init = owned_rng
+    train_state = get_train_state()
+    train_state.iteration = 3
+    train_state.consumed_train_samples = 24
+    train_state.consumed_valid_samples = 8
+    train_state.num_floating_point_operations_so_far = 17
+
+    class SiteModel(MockModel):
+        def __init__(self, value):
+            super().__init__(TransformerConfig(num_layers=1, kv_channels=1))
+            # Canonical DTensor shards exercise native DCP planning. No collective
+            # is needed to construct this intentionally site-specific test state.
+            for name, parameter in list(self.l.named_parameters()):
+                shape = (group_size,) + tuple(parameter.shape[1:])
+                local = torch.full((1,) + shape[1:], value, device="cuda")
+                tensor = DTensor.from_local(
+                    local,
+                    mesh,
+                    (Replicate(), Shard(0)),
+                    shape=shape,
+                    stride=torch.empty(shape).stride(),
+                    run_check=False,
+                )
+                setattr(self.l, name, torch.nn.Parameter(tensor))
+
+    model = SiteModel(float(site_id + 1))
+    momentum = torch.full_like(model.l.weight, site_id + 5.0)
+    optimizer = MockState({"momentum": momentum})
+    scheduler = MockOptParamScheduler({"num_steps": 3})
+    torch.manual_seed(1000 + Utils.rank)
+    random.seed(1000 + Utils.rank)
+    np.random.seed(1000 + Utils.rank)
+    model_parallel_cuda_manual_seed(1000 + Utils.rank)
+    expected_rng = (
+        torch.get_rng_state().clone(),
+        torch.cuda.get_rng_state().clone(),
+        random.getstate(),
+        np.random.get_state(),
+        {name: state.clone() for name, state in get_cuda_rng_tracker().get_states().items()},
+    )
+    # Save sites sequentially to catch accidental WORLD collectives in DCP,
+    # RNG gathering, tracker finalization, or dataloader state writing.
+    first_done = tmp_path_dist_ckpt / "native_first_done"
+    second_done = tmp_path_dist_ckpt / "native_second_done"
+    if Utils.rank == 0:
+        first_done.unlink(missing_ok=True)
+        second_done.unlink(missing_ok=True)
+    dist.barrier()
+
+    def wait_for(path):
+        deadline = time.monotonic() + 60
+        while not path.exists():
+            if time.monotonic() > deadline:
+                pytest.fail(f"Site save did not finish independently: {path.name}")
+            time.sleep(0.1)
+
+    if site_id == 1:
+        wait_for(first_done)
+    save_checkpoint(
+        3,
+        [model],
+        optimizer,
+        scheduler,
+        17,
+        non_persistent_ckpt=non_persistent,
+        train_data_iterator=SimpleNamespace(
+            iterable=SimpleNamespace(save_state=lambda: {"rank": Utils.rank})
+        ),
+        checkpoint_group=None if automatic_site_id else site_group,
+    )
+    save_root = args.non_persistent_global_ckpt_dir if non_persistent else args.save
+    assert (save_root / "latest_checkpointed_iteration.txt").read_text() == "3"
+    checkpoint_path = save_root / "iter_0000003"
+    metadata = torch.distributed.checkpoint.FileSystemReader(checkpoint_path).read_metadata()
+    assert all(
+        (checkpoint_path / item.relative_path).is_file() for item in metadata.storage_data.values()
+    )
+    if dist.get_rank(site_group) == 0:
+        (first_done if site_id == 0 else second_done).touch()
+    if site_id == 0:
+        wait_for(second_done)
+
+    restored = SiteModel(0.0)
+    restored_optimizer = MockState({"momentum": torch.zeros_like(momentum)})
+    restored_scheduler = MockOptParamScheduler({"num_steps": 0})
+    train_state.iteration = train_state.consumed_train_samples = 0
+    train_state.consumed_valid_samples = 0
+    torch.manual_seed(9876)
+    model_parallel_cuda_manual_seed(9876)
+    assert load_checkpoint(
+        [restored],
+        restored_optimizer,
+        restored_scheduler,
+        checkpoint_group=None if automatic_site_id else site_group,
+        restore_training_state=True,
+    ) == (3, 17)
+    for parameter in restored.parameters():
+        torch.testing.assert_close(
+            parameter.to_local(), torch.full_like(parameter.to_local(), site_id + 1.0)
+        )
+    torch.testing.assert_close(
+        restored_optimizer.state_dict()["momentum"].to_local(), momentum.to_local()
+    )
+    assert restored_scheduler.num_steps == 3
+    assert train_state.iteration == 3
+    assert train_state.consumed_train_samples == 24
+    assert train_state.consumed_valid_samples == 8
+    assert torch.equal(torch.get_rng_state(), expected_rng[0])
+    assert torch.equal(torch.cuda.get_rng_state(), expected_rng[1])
+    assert random.getstate() == expected_rng[2]
+    np.testing.assert_equal(np.random.get_state(), expected_rng[3])
+    for name, state in expected_rng[4].items():
+        assert torch.equal(get_cuda_rng_tracker().get_states()[name], state)
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])

@@ -18,7 +18,7 @@ from enum import Enum, auto
 from logging import DEBUG, getLogger
 from pathlib import Path
 from time import time
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -312,7 +312,7 @@ def get_load_checkpoint_path_by_args(args, load_arg='load'):
             iteration, release = read_metadata(tracker_filename)
 
     # Allow user to specify the loaded iteration.
-    if getattr(args, 'ckpt_step', None):
+    if getattr(args, 'ckpt_step', None) is not None:
         iteration = args.ckpt_step
 
     return get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
@@ -410,7 +410,7 @@ def checkpoint_exists(checkpoints_path):
     return maybe_msc.os.path.isfile(path)
 
 
-def read_metadata(tracker_filename):
+def read_metadata(tracker_filename, checkpoint_group=None):
     # Read the tracker file and either set the iteration or
     # mark it as a release checkpoint.
     iteration = -1
@@ -433,7 +433,9 @@ def read_metadata(tracker_filename):
     # Get the max iteration retrieved across the ranks.
     if torch.distributed.is_initialized():
         iters_cuda = torch.tensor([iteration], dtype=torch.long, device='cuda')
-        torch.distributed.all_reduce(iters_cuda, op=torch.distributed.ReduceOp.MAX)
+        torch.distributed.all_reduce(
+            iters_cuda, op=torch.distributed.ReduceOp.MAX, group=checkpoint_group
+        )
         max_iter = iters_cuda[0].item()
 
         # We should now have all the same iteration.
@@ -455,7 +457,7 @@ def read_metadata(tracker_filename):
     return max_iter, release
 
 
-def read_frozen_resume_iteration(save_dir):
+def read_frozen_resume_iteration(save_dir, checkpoint_group=None):
     """Resume iteration for a ``--freeze-all-layers`` run.
 
     Returns the integer recorded in ``save_dir``'s progress tracker
@@ -469,7 +471,7 @@ def read_frozen_resume_iteration(save_dir):
     tracker_filename = get_checkpoint_tracker_filename(save_dir)
     if not maybe_msc.os.path.isfile(tracker_filename):
         return 0
-    iteration, _release = read_metadata(tracker_filename)
+    iteration, _release = read_metadata(tracker_filename, checkpoint_group=checkpoint_group)
     return iteration
 
 
@@ -480,12 +482,14 @@ def get_rng_state(
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     dp_group: Optional[torch.distributed.ProcessGroup] = None,
     key_prefix: str = '',
+    checkpoint_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Union[List[Dict[str, Any]], ShardedObject]:
     """Collect rng state across data parallel ranks.
 
     dp_group threads the data-parallel group used for RNG gather/indexing.
     dp_cp_group threads the data-parallel (with context-parallel) group used for the rng shard key.
     key_prefix namespaces the rng ShardedObject key so disjoint grids avoid a key collision (default '').
+    checkpoint_group limits RNG state to one complete checkpoint domain.
     """
     cfg = get_run_config()
     rng_state = {
@@ -500,7 +504,16 @@ def get_rng_state(
         get_pg_size(dp_group) if dp_group is not None else mpu.get_data_parallel_world_size()
     )
     rng_state_list = None
-    if cfg.rng.data_parallel_random_init and torch.distributed.is_initialized() and dp_world_size > 1:
+    if checkpoint_group is not None and ckpt_format in ('torch_dist', 'fsdp_dtensor'):
+        # Each site's checkpoint stores every participating rank's RNG state
+        # separately. Gathering across the global DP group would both
+        # cross sites and store RNG state for ranks absent from this checkpoint.
+        rng_state_list = [rng_state]
+    elif (
+        cfg.rng.data_parallel_random_init
+        and torch.distributed.is_initialized()
+        and dp_world_size > 1
+    ):
         rng_state_list = [None for i in range(dp_world_size)]
         torch.distributed.all_gather_object(
             rng_state_list,
@@ -516,6 +529,14 @@ def get_rng_state(
         else mpu.get_data_parallel_group(with_context_parallel=True)
     )
     dp_cp_rank = get_pg_rank(dp_cp_group)
+    if checkpoint_group is not None:
+        domain_ranks = set(torch.distributed.get_process_group_ranks(checkpoint_group))
+        local_dp_cp_ranks = [
+            rank
+            for rank in torch.distributed.get_process_group_ranks(dp_cp_group)
+            if rank in domain_ranks
+        ]
+        dp_cp_rank = local_dp_cp_ranks.index(torch.distributed.get_rank())
     if ckpt_format == 'torch_dist':
         pp_rank = get_pg_rank(pp_group)
         pp_size = get_pg_size(pp_group)
@@ -524,7 +545,9 @@ def get_rng_state(
         # Tracker streams are seeded per rank (tensor_parallel/random.py), so an axis left out
         # of the key becomes a replica and those ranks restore a peer's stream. ep/etp/gtp_remat
         # do not tile the grid; pp x tp x dp_cp does.
-        dp_cp_size = get_pg_size(dp_cp_group)
+        dp_cp_size = (
+            len(local_dp_cp_ranks) if checkpoint_group is not None else get_pg_size(dp_cp_group)
+        )
         rng_state_list = ShardedObject(
             f'{key_prefix}rng_state',
             rng_state_list,
@@ -532,11 +555,16 @@ def get_rng_state(
             (pp_rank, tp_rank, dp_cp_rank),
         )
     elif ckpt_format == 'fsdp_dtensor':
-        # TODO: this key omits dp_cp, so dp_cp peers become replicas and restore each other's
-        # tracker streams. Fixing it also needs the matching lookup in load_checkpoint.
+        # Site checkpoints use a distinct key for every rank's tracker streams.
+        # Keep the historical TP/PP-only layout for unscoped checkpoints.
         pp_rank = get_pg_rank(pp_group)
         tp_rank = get_pg_rank(tp_group)
-        rng_state_list = {f'({pp_rank}, {tp_rank})': rng_state_list}
+        key = (
+            f'({pp_rank}, {tp_rank}, {dp_cp_rank})'
+            if checkpoint_group is not None
+            else f'({pp_rank}, {tp_rank})'
+        )
+        rng_state_list = {key: rng_state_list}
 
     return rng_state_list
 
@@ -637,6 +665,66 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
     )
 
 
+def _default_site_checkpoint_groups(args, checkpoint_group, parallelization_group, *, loading):
+    """Default to site-local checkpoint domains and torch_dist replication groups."""
+    if checkpoint_group is not None:
+        return checkpoint_group, parallelization_group
+    site_group = mpu.get_site_group(check_initialized=False)
+    if site_group is None:
+        return checkpoint_group, parallelization_group
+    if args.ckpt_format not in ('torch_dist', 'fsdp_dtensor'):
+        raise ValueError(
+            '--site-id checkpointing requires --ckpt-format torch_dist or fsdp_dtensor; '
+            f'got {args.ckpt_format!r}'
+        )
+    if args.ckpt_format == 'fsdp_dtensor':
+        # Native DCP handles DTensor replication; fully parallel MCore wrappers
+        # and their separate replication groups apply only to torch_dist.
+        return site_group, parallelization_group
+    if parallelization_group is None:
+        kind = (
+            args.ckpt_fully_parallel_load_process_group
+            if loading
+            else args.ckpt_fully_parallel_save_process_group
+        )
+        if kind == 'dp':
+            parallelization_group = mpu.get_site_data_parallel_group(with_context_parallel=True)
+        elif kind == 'ep_dp':
+            parallelization_group = mpu.get_site_expert_data_parallel_group()
+        else:
+            raise ValueError(f'Invalid checkpoint parallelization group: {kind}')
+    return site_group, parallelization_group
+
+
+def _validate_site_resume_agreement(checkpoint_group, phase, state):
+    """Check that independently stored site checkpoints describe one training step.
+
+    Only small progress metadata crosses sites. Checkpoint files and DCP planning
+    remain scoped to ``checkpoint_group``.
+    """
+    if checkpoint_group is None or not torch.distributed.is_initialized():
+        return
+    if torch.distributed.get_world_size(group=checkpoint_group) == torch.distributed.get_world_size():
+        return
+
+    domain_rank = min(torch.distributed.get_process_group_ranks(checkpoint_group))
+    reports = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(reports, (domain_rank, state))
+    states_by_domain = {}
+    for rank, (domain, reported_state) in enumerate(reports):
+        states_by_domain.setdefault(domain, {})[rank] = reported_state
+    if len({reported_state for _, reported_state in reports}) > 1:
+        summary = ", ".join(
+            f"domain {domain}: {sorted(set(values.values()), key=str)}"
+            for domain, values in sorted(states_by_domain.items())
+        )
+        raise RuntimeError(
+            f"Site checkpoint {phase} differs across ranks ({summary}). "
+            "Load the same checkpoint format and iteration on every site; "
+            "use --ckpt-step to select a common iteration explicitly."
+        )
+
+
 def save_checkpoint(
     iteration,
     model,
@@ -662,6 +750,9 @@ def save_checkpoint(
     rng_state_key_prefix: str = '',
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     on_saved: Optional[Callable[[], None]] = None,
+    checkpoint_group: Optional[torch.distributed.ProcessGroup] = None,
+    preferred_writer_ranks: Optional[Sequence[int]] = None,
+    checkpoint_parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
@@ -688,10 +779,22 @@ def save_checkpoint(
             when available. Callers using CP without global MPU initialization must pass it.
         on_saved: Called once the checkpoint is durable: after the barrier of a synchronous
             save, as a finalize function of an asynchronous one.
+        checkpoint_group: Ranks that write one complete torch_dist or fsdp_dtensor checkpoint. The
+            caller provides a site-local path and a group containing a complete
+            model and optimizer state. Defaults to WORLD.
+        preferred_writer_ranks: Global ranks of a preferred optimizer instance in
+            checkpoint_group. Ranks outside the preference still write shards
+            absent from it, such as per-rank RNG and dataloader state. If omitted,
+            all ranks in checkpoint_group are eligible.
+        checkpoint_parallelization_group: Site-local replication group for the
+            fully parallel save wrapper. Must be contained in checkpoint_group.
     """
     start_ckpt = time()
     cfg = get_run_config()
     args = get_args()
+    checkpoint_group, checkpoint_parallelization_group = _default_site_checkpoint_groups(
+        args, checkpoint_group, checkpoint_parallelization_group, loading=False
+    )
 
     if args.async_save and not is_empty_async_queue():
         print_rank_0(
@@ -725,7 +828,10 @@ def save_checkpoint(
             )
             # TODO Can we ensure the previous checkpoint is saved? We don't want to allow two saves in parallel.
             cleanup_old_non_persistent_checkpoint(
-                save_dir, leave_ckpt_num=1, do_async=args.async_save
+                save_dir,
+                leave_ckpt_num=1,
+                do_async=args.async_save,
+                checkpoint_group=checkpoint_group,
             )
         elif args.non_persistent_ckpt_type == 'local':
             ckpt_type = CheckpointType.LOCAL
@@ -736,6 +842,19 @@ def save_checkpoint(
             )
 
     ckpt_format = args.ckpt_format if ckpt_type == CheckpointType.GLOBAL else 'torch'
+    if checkpoint_group is not None and ckpt_format not in ('torch_dist', 'fsdp_dtensor'):
+        raise ValueError(
+            'checkpoint_group is supported only for global torch_dist or fsdp_dtensor checkpoints'
+        )
+    if checkpoint_group is not None and args.async_save:
+        raise NotImplementedError(
+            'Asynchronous checkpointing with a subgroup is unsupported: '
+            'NVRx AsyncRequest finalization uses WORLD collectives.'
+        )
+    if ckpt_format == 'fsdp_dtensor' and preferred_writer_ranks:
+        raise NotImplementedError('fsdp_dtensor does not support preferred_writer_ranks')
+    if checkpoint_group is not None and preferred_writer_ranks is None:
+        preferred_writer_ranks = ()
     print_rank_0(
         f'[{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] saving checkpoint '
         f'at iteration {iteration:7d} to {save_dir} in {ckpt_format} format'
@@ -752,12 +871,15 @@ def save_checkpoint(
         dp_cp_group=dp_cp_group,
         dp_group=dp_group,
         key_prefix=rng_state_key_prefix,
+        checkpoint_group=checkpoint_group,
     )
 
     # Collect rerun state across all ranks
     rerun_state_machine = get_rerun_state_machine()
     rerun_state = rerun_state_machine.state_dict(
-        data_iterator=train_data_iterator, ckpt_format=args.ckpt_format
+        data_iterator=train_data_iterator,
+        ckpt_format=args.ckpt_format,
+        checkpoint_group=checkpoint_group,
     )
 
     # Checkpoint name.
@@ -870,7 +992,10 @@ def save_checkpoint(
         state_dict = prepare_glu_checkpoint_for_save(state_dict, args)
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if ckpt_type == CheckpointType.GLOBAL and ckpt_format == 'torch_dist':
-            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            if (
+                not torch.distributed.is_initialized()
+                or torch.distributed.get_rank(group=checkpoint_group) == 0
+            ):
                 # TODO Handle non-empty directories (e.g., after a crash during saving).
                 ensure_directory_exists(checkpoint_name, check_parent=False)
             if checkpointing_context is not None and 'save_strategy' in checkpointing_context:
@@ -909,7 +1034,9 @@ def save_checkpoint(
                             )
 
                 if args.ckpt_fully_parallel_save:
-                    if args.ckpt_fully_parallel_save_process_group == 'dp':
+                    if checkpoint_parallelization_group is not None:
+                        process_group = checkpoint_parallelization_group
+                    elif args.ckpt_fully_parallel_save_process_group == 'dp':
                         process_group = (
                             dp_cp_group
                             if dp_cp_group is not None
@@ -951,12 +1078,17 @@ def save_checkpoint(
                     preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn,
                     content_metadata=_clean_metadata_for_serialization(sharded_sd_metadata),
                     verify_integrity=args.verify_integrity,
+                    process_group=checkpoint_group,
+                    preferred_writer_ranks=preferred_writer_ranks,
                 )
             # [ModelOpt]: save sharded modelopt_state
             if has_nvidia_modelopt:
                 save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))
         elif ckpt_type == CheckpointType.GLOBAL and ckpt_format in ['torch_dcp', 'fsdp_dtensor']:
-            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            if (
+                not torch.distributed.is_initialized()
+                or torch.distributed.get_rank(group=checkpoint_group) == 0
+            ):
                 # TODO Handle non-empty directories (e.g., after a crash during saving).
                 ensure_directory_exists(checkpoint_name, check_parent=False)
 
@@ -1008,7 +1140,9 @@ def save_checkpoint(
             else:
                 fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(checkpoint_name)
                 torch.distributed.checkpoint.save(
-                    state_dict=state_dict, storage_writer=fs_storage_writer
+                    state_dict=state_dict,
+                    storage_writer=fs_storage_writer,
+                    process_group=checkpoint_group,
                 )
         else:
             # [ModelOpt]: Inject modelopt_state into state_dict
@@ -1087,6 +1221,7 @@ def save_checkpoint(
         pp_group=pp_group,
         dp_group=dp_gtp_remat_group,
         cp_group=cp_group,
+        checkpoint_group=checkpoint_group,
     )
 
     start_misc = time()
@@ -1095,12 +1230,12 @@ def save_checkpoint(
             assert async_save_request is None
             # Wait so everyone is done (necessary)
             if torch.distributed.is_initialized():
-                torch.distributed.barrier()
+                torch.distributed.barrier(group=checkpoint_group)
 
     # And update the latest iteration
     if not skip_weight_ckpt and (
         not torch.distributed.is_initialized()
-        or torch.distributed.get_rank() == 0
+        or torch.distributed.get_rank(group=checkpoint_group) == 0
     ):
         tracker_filename = get_checkpoint_tracker_filename(save_dir)
 
@@ -1162,7 +1297,9 @@ def save_checkpoint(
                     iteration=iteration,
                     return_base_dir=True,
                 )
-                from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
+                from megatron.training.utils.checkpoint_utils import (
+                    get_checkpoint_run_config_filename,
+                )
 
                 run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
 
@@ -1194,7 +1331,9 @@ def save_checkpoint(
                     and iteration > 0
                 ):
                     config = _default_config_from_args(TokenizerConfig, args)
-                    save_tokenizer_assets(get_tokenizer(), config, checkpoint_name)
+                    save_tokenizer_assets(
+                        get_tokenizer(), config, checkpoint_name, checkpoint_group=checkpoint_group
+                    )
                 if cfg.logger.log_progress and args.async_save:
                     append_to_progress_log(
                         args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
@@ -1326,7 +1465,7 @@ def save_checkpoint(
         # Add a barrier so that all ranks wait for finalization to complete
         # before returning from this function.
         if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+            torch.distributed.barrier(group=checkpoint_group)
 
         if on_saved is not None:
             on_saved()
@@ -1340,6 +1479,7 @@ def save_tokenizer_assets(
     checkpoint_path: str,
     *,
     raise_on_error: bool = False,
+    checkpoint_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> None:
     """Save tokenizer files to the checkpoint directory.
 
@@ -1352,12 +1492,17 @@ def save_tokenizer_assets(
         config: Tokenizers config.
         checkpoint_path: The checkpoint directory path.
         raise_on_error: Propagate tokenizer persistence errors to the caller.
+        checkpoint_group: The group that owns this checkpoint directory.
     """
     if tokenizer is None:
         return
 
-    # Only rank 0 saves tokenizer files
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    # The first rank of each checkpoint group saves its site's tokenizer files.
+    rank = (
+        torch.distributed.get_rank(group=checkpoint_group)
+        if torch.distributed.is_initialized()
+        else 0
+    )
     if rank != 0:
         return
 
@@ -1523,8 +1668,13 @@ def _async_delete_checkpoint_impl(
         pass
 
 
-def cleanup_old_non_persistent_checkpoint(save_dir, leave_ckpt_num=1, do_async=False):
-    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+def cleanup_old_non_persistent_checkpoint(
+    save_dir, leave_ckpt_num=1, do_async=False, checkpoint_group=None
+):
+    if (
+        torch.distributed.is_initialized()
+        and torch.distributed.get_rank(group=checkpoint_group) != 0
+    ):
         return
     save_dir = Path(save_dir)
 
@@ -1558,6 +1708,7 @@ def maybe_save_dataloader_state(
     pp_group=None,
     dp_group=None,
     cp_group=None,
+    checkpoint_group=None,
 ):
     """Saves dataloader state if the dataloader supports it.
 
@@ -1584,6 +1735,8 @@ def maybe_save_dataloader_state(
             data-parallel group instead makes gtp_remat peers write the same file.
         cp_group (ProcessGroup): Context-parallel group, or the MPU group when available.
             No group preserves the TP0/PP0 writer behavior without requiring MPU initialization.
+        checkpoint_group (ProcessGroup): Site-local checkpoint group. When provided,
+            every writer creates its own directory and no cross-site DP barrier is used.
     """
     # If no dataloader or saving path is provided, exit early, otherwise, raise an error.
     if train_iterator is None or dataloader_save_path is None or dataloader_save_path == '':
@@ -1622,12 +1775,23 @@ def maybe_save_dataloader_state(
         train_iterator.iterable, 'is_save_state_rank_independent', False
     )
     # Ranks that will not write anything skip building the state at all.
-    writes_state_file = dp_rank == 0 or not is_save_state_rank_independent
+    data_parallel_group = dp_group if dp_group is not None else mpu.get_data_parallel_group()
+    if checkpoint_group is not None:
+        domain_ranks = set(torch.distributed.get_process_group_ranks(checkpoint_group))
+        local_data_ranks = [
+            rank
+            for rank in torch.distributed.get_process_group_ranks(data_parallel_group)
+            if rank in domain_ranks
+        ]
+        writes_rank_independent_state = torch.distributed.get_rank() == local_data_ranks[0]
+    else:
+        writes_rank_independent_state = dp_rank == 0
+    writes_state_file = writes_rank_independent_state or not is_save_state_rank_independent
     train_dataloader_state_dict = (
         train_iterator.iterable.save_state() if writes_state_file else None
     )
     state_file_rank = 0 if is_save_state_rank_independent else dp_rank
-    if dp_rank == 0:
+    if writes_rank_independent_state:
         print(f'saving dataloader checkpoint at iteration {iteration} to {dataloader_save_path}')
     data_state_save_path = get_checkpoint_name(
         dataloader_save_path,
@@ -1645,13 +1809,13 @@ def maybe_save_dataloader_state(
         basename=f'train_dataloader_dprank{state_file_rank:03d}.pt',
     )
 
-    data_parallel_group = dp_group if dp_group is not None else mpu.get_data_parallel_group()
-    torch.distributed.barrier(group=data_parallel_group)
-
-    if dp_rank == 0:
+    if checkpoint_group is None:
+        torch.distributed.barrier(group=data_parallel_group)
+        if dp_rank == 0:
+            ensure_directory_exists(data_state_save_path)
+        torch.distributed.barrier(group=data_parallel_group)
+    elif writes_state_file:
         ensure_directory_exists(data_state_save_path)
-
-    torch.distributed.barrier(group=data_parallel_group)
 
     if train_dataloader_state_dict is None:
         return
@@ -1939,13 +2103,15 @@ def fix_query_key_value_ordering(model, checkpoint_version):
         )
 
 
-def _get_non_persistent_iteration(non_persistent_global_dir, args, checkpointing_context=None):
+def _get_non_persistent_iteration(
+    non_persistent_global_dir, args, checkpointing_context=None, checkpoint_group=None
+):
     if args.non_persistent_ckpt_type is None:
         return -1
     elif args.non_persistent_ckpt_type == 'global':
         tracker_filename = get_checkpoint_tracker_filename(non_persistent_global_dir)
         if maybe_msc.os.path.isfile(tracker_filename):
-            iteration, release = read_metadata(tracker_filename)
+            iteration, release = read_metadata(tracker_filename, checkpoint_group=checkpoint_group)
             if release:
                 raise RuntimeError("Non-persistent checkpoint can't be a release checkpoint")
         else:
@@ -1971,6 +2137,8 @@ def _load_non_persistent_base_checkpoint(
     dp_cp_group=None,
     expt_dp_group=None,
     checkpoint_group=None,
+    preferred_reader_ranks=None,
+    checkpoint_parallelization_group=None,
     gtp_pad_for_alignment=None,
 ):
     """Load the base state_dict from a non-persistent distributed checkpoint.
@@ -1978,6 +2146,22 @@ def _load_non_persistent_base_checkpoint(
     """
     assert args.non_persistent_ckpt_type is not None
     if args.non_persistent_ckpt_type == 'global':
+        if args.ckpt_format == 'fsdp_dtensor':
+            persistent_args = copy.copy(args)
+            persistent_args.non_persistent_ckpt_type = None
+            persistent_args.non_persistent_global_ckpt_dir = None
+            persistent_args.ckpt_step = non_persistent_iteration
+            return _load_base_checkpoint(
+                non_persistent_global_dir,
+                persistent_args,
+                rank0=rank0,
+                sharded_state_dict=sharded_state_dict,
+                checkpointing_context=checkpointing_context,
+                dp_cp_group=dp_cp_group,
+                expt_dp_group=expt_dp_group,
+                checkpoint_group=checkpoint_group,
+                gtp_pad_for_alignment=gtp_pad_for_alignment,
+            )
         if not rank0:
             print_rank_0(
                 f'Loading from a non-persistent checkpoint (non-persistent iter {non_persistent_iteration})'
@@ -1993,6 +2177,8 @@ def _load_non_persistent_base_checkpoint(
             dp_cp_group=dp_cp_group,
             expt_dp_group=expt_dp_group,
             checkpoint_group=checkpoint_group,
+            preferred_reader_ranks=preferred_reader_ranks,
+            checkpoint_parallelization_group=checkpoint_parallelization_group,
             gtp_pad_for_alignment=gtp_pad_for_alignment,
         )
     elif args.non_persistent_ckpt_type == 'local':
@@ -2035,6 +2221,8 @@ def _load_global_dist_base_checkpoint(
     dp_cp_group=None,
     expt_dp_group=None,
     checkpoint_group=None,
+    preferred_reader_ranks=None,
+    checkpoint_parallelization_group=None,
     gtp_pad_for_alignment=None,
 ):
     """Load the base state_dict from the given directory containing the global distributed checkpoint"""
@@ -2059,7 +2247,9 @@ def _load_global_dist_base_checkpoint(
     )
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if args.ckpt_fully_parallel_load:
-        if args.ckpt_fully_parallel_load_process_group == 'dp':
+        if checkpoint_parallelization_group is not None:
+            process_group = checkpoint_parallelization_group
+        elif args.ckpt_fully_parallel_load_process_group == 'dp':
             process_group = (
                 dp_cp_group
                 if dp_cp_group is not None
@@ -2100,6 +2290,7 @@ def _load_global_dist_base_checkpoint(
         strict=args.dist_ckpt_strictness,
         verify_integrity=args.verify_integrity,
         process_group=checkpoint_group,
+        preferred_reader_ranks=preferred_reader_ranks,
     )
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
@@ -2134,6 +2325,8 @@ def _load_base_checkpoint(
     dp_cp_group=None,
     expt_dp_group=None,
     checkpoint_group=None,
+    preferred_reader_ranks=None,
+    checkpoint_parallelization_group=None,
     gpt_compat_layer_maps=None,
     gtp_pad_for_alignment=None,
 ):
@@ -2148,7 +2341,7 @@ def _load_base_checkpoint(
         else os.path.join(load_dir, _NON_PERSISTENT_CKPT_SUBDIR)
     )
     non_persistent_iteration = _get_non_persistent_iteration(
-        non_persistent_global_dir, args, checkpointing_context
+        non_persistent_global_dir, args, checkpointing_context, checkpoint_group=checkpoint_group
     )
     iteration, release = -1, False
     tracker_filename = 'because load directory is not defined'
@@ -2161,18 +2354,26 @@ def _load_base_checkpoint(
         else:
             tracker_filename = get_checkpoint_tracker_filename(load_dir)
             if maybe_msc.os.path.isfile(tracker_filename):
-                iteration, release = read_metadata(tracker_filename)
+                iteration, release = read_metadata(
+                    tracker_filename, checkpoint_group=checkpoint_group
+                )
 
     # Allow user to specify the loaded iteration.
-    if getattr(args, 'ckpt_step', None):
-        iteration = args.ckpt_step
+    requested_step = getattr(args, 'ckpt_step', None)
+    if requested_step is not None:
+        iteration = requested_step
+
+    use_non_persistent = non_persistent_iteration != -1 and (
+        (requested_step is None and non_persistent_iteration >= iteration)
+        or requested_step == non_persistent_iteration
+    )
 
     # Record the iteration loaded (stored separately from args to avoid
     # polluting checkpoints, since args is saved in checkpoints).
-    set_loaded_iteration(iteration)
+    set_loaded_iteration(non_persistent_iteration if use_non_persistent else iteration)
 
     if non_persistent_iteration != -1:  # there is a non-persistent checkpoint
-        if non_persistent_iteration >= iteration:
+        if use_non_persistent:
             return _load_non_persistent_base_checkpoint(
                 non_persistent_global_dir,
                 args,
@@ -2183,9 +2384,11 @@ def _load_base_checkpoint(
                 dp_cp_group=dp_cp_group,
                 expt_dp_group=expt_dp_group,
                 checkpoint_group=checkpoint_group,
+                preferred_reader_ranks=preferred_reader_ranks,
+                checkpoint_parallelization_group=checkpoint_parallelization_group,
                 gtp_pad_for_alignment=gtp_pad_for_alignment,
             )
-        else:
+        elif requested_step is None:
             print_rank_0('WARNING: non-persistent checkpoints are older than persistent checkpoint')
 
     # Otherwise we are dealing with global checkpoints
@@ -2202,7 +2405,7 @@ def _load_base_checkpoint(
                 f"'{tracker_filename}'). Exiting with a non-zero status. <<"
             )
             if torch.distributed.is_initialized():
-                torch.distributed.barrier()
+                torch.distributed.barrier(group=checkpoint_group)
             # Exit non-zero so that callers (e.g. CI harnesses) detect the missing
             # checkpoint as a failure instead of silently treating exit code 0 as success.
             sys.exit(1)
@@ -2237,6 +2440,8 @@ def _load_base_checkpoint(
             dp_cp_group=dp_cp_group,
             expt_dp_group=expt_dp_group,
             checkpoint_group=checkpoint_group,
+            preferred_reader_ranks=preferred_reader_ranks,
+            checkpoint_parallelization_group=checkpoint_parallelization_group,
             gtp_pad_for_alignment=gtp_pad_for_alignment,
         )
     elif ckpt_format == 'torch':
@@ -2275,7 +2480,11 @@ def _load_base_checkpoint(
         assert HAVE_MEGATRON_FSDP, 'Should not be called if Megatron-FSDP is not available.'
         if rank0:
             state_dict = {'args': None, 'iteration': None, 'checkpoint_version': None}
-            torch.distributed.checkpoint.load(state_dict=state_dict, checkpoint_id=checkpoint_name)
+            torch.distributed.checkpoint.load(
+                state_dict=state_dict,
+                checkpoint_id=checkpoint_name,
+                process_group=checkpoint_group,
+            )
             return state_dict, checkpoint_name, release, CheckpointType.FSDP_DTENSOR
 
         state_dict = sharded_state_dict
@@ -2327,7 +2536,10 @@ def _load_base_checkpoint(
 
         planner = default_planner.DefaultLoadPlanner(allow_partial_load=allow_partial_load)
         torch.distributed.checkpoint.load_state_dict(
-            state_dict=state_dict, storage_reader=fs_storage_reader, planner=planner
+            state_dict=state_dict,
+            storage_reader=fs_storage_reader,
+            planner=planner,
+            process_group=checkpoint_group,
         )
 
         if raw_optimizer_state_dict is not None:
@@ -2636,6 +2848,8 @@ def load_checkpoint(
     dp_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
     checkpoint_group: Optional[torch.distributed.ProcessGroup] = None,
+    preferred_reader_ranks: Optional[Sequence[int]] = None,
+    checkpoint_parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
     rng_state_key_prefix: str = '',
     model_sharded_state_dict_modifier: Optional[Callable[[Dict], None]] = None,
     *,
@@ -2659,9 +2873,19 @@ def load_checkpoint(
     expt_dp_group: Expert data parallel group (default: None, falls back to mpu API)
     checkpoint_group: Ranks that collectively form one complete checkpoint
         view (default: None, uses the global process group)
+    preferred_reader_ranks: Global ranks preferred to read each shard from
+        a site-local checkpoint. Other ranks read shards absent from them. If
+        omitted, all ranks in checkpoint_group are eligible.
+    checkpoint_parallelization_group: Site-local replication group for the
+        fully parallel load wrapper. Must be contained in checkpoint_group.
     """
     cfg = get_run_config()
     args = get_args()
+    checkpoint_group, checkpoint_parallelization_group = _default_site_checkpoint_groups(
+        args, checkpoint_group, checkpoint_parallelization_group, loading=True
+    )
+    if checkpoint_group is not None and preferred_reader_ranks is None:
+        preferred_reader_ranks = ()
     load_dir = getattr(args, load_arg)
     loading_pretrained_checkpoint = False
 
@@ -2683,7 +2907,9 @@ def load_checkpoint(
         # those; --freeze-all-layers alone would still load the scheduler and assert on arg drift).
         args.finetune = True
         if args.override_ckpt_iteration is None:
-            progress_iteration = read_frozen_resume_iteration(args.save)
+            progress_iteration = read_frozen_resume_iteration(
+                args.save, checkpoint_group=checkpoint_group
+            )
             if progress_iteration > 0:
                 args.override_ckpt_iteration = progress_iteration
 
@@ -2707,7 +2933,11 @@ def load_checkpoint(
     if args.auto_detect_ckpt_format or ckpt_format in ('torch_dist', 'fsdp_dtensor'):
         with _otel_managed_span('load_checkpoint', 'megatron.checkpoint.load.io_read', is_goodput_span=True):
             state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
-                load_dir, args, rank0=True, checkpointing_context=checkpointing_context
+                load_dir,
+                args,
+                rank0=True,
+                checkpointing_context=checkpointing_context,
+                checkpoint_group=checkpoint_group,
             )
 
         ckpt_format = None
@@ -2723,6 +2953,29 @@ def load_checkpoint(
             pass  # Not loaded.
         else:
             raise NotImplementedError(f'checkpoint format {ckpt_format} not supported')
+
+    # Every rank must enter this preflight before any rank rejects an on-disk
+    # format. Otherwise a site that detected an unsupported format can leave
+    # other sites waiting in a later world collective.
+    selection = (ckpt_format,)
+    if restore_training_state and not args.finetune:
+        selected_iteration = (
+            state_dict.get('iteration', state_dict.get('total_iters'))
+            if state_dict is not None
+            else None
+        )
+        selection += (
+            selected_iteration,
+            bool(release),
+            bool(loading_pretrained_checkpoint),
+        )
+    _validate_site_resume_agreement(checkpoint_group, 'selection', selection)
+    if checkpoint_group is not None and ckpt_format not in ('torch_dist', 'fsdp_dtensor', None):
+        raise ValueError(
+            'checkpoint_group is supported only for torch_dist or fsdp_dtensor checkpoints'
+        )
+    if ckpt_format == 'fsdp_dtensor' and preferred_reader_ranks:
+        raise NotImplementedError('fsdp_dtensor does not support preferred_reader_ranks')
 
     if ckpt_format == 'torch' and getattr(args, 'inference_shards', None):
         raise ValueError(
@@ -2822,6 +3075,7 @@ def load_checkpoint(
                 dp_cp_group=dp_cp_group,
                 dp_group=dp_group,
                 key_prefix=rng_state_key_prefix,
+                checkpoint_group=checkpoint_group,
             )  # we can load the rng state
         else:
             ignore_rng_state = True
@@ -2953,7 +3207,10 @@ def load_checkpoint(
             # Include it in strict load requests without resuming a rerun.
             if restore_rerun_state or idle_rerun_state:
                 gen_sd_rerun_state = rerun_state_machine.state_dict(
-                    data_iterator=None, ckpt_format=ckpt_format, force=True
+                    data_iterator=None,
+                    ckpt_format=ckpt_format,
+                    force=True,
+                    checkpoint_group=checkpoint_group,
                 )
                 ignore_rerun_state = not restore_rerun_state
         if ckpt_world_size != run_world_size or ckpt_tp_pp != run_tp_pp or ckpt_dp != run_dp:
@@ -3019,7 +3276,9 @@ def load_checkpoint(
             sharded_state_dict['opt_param_scheduler'] = opt_param_scheduler.state_dict()
         load_kwargs['sharded_state_dict'] = sharded_state_dict
     elif args.ckpt_format == 'fsdp_dtensor':
-        reader = FileSystemReader(get_load_checkpoint_path_by_args(args))
+        # Use the selected checkpoint, including a non-persistent checkpoint or
+        # an alternate load_arg, without re-reading a tracker with WORLD collectives.
+        reader = FileSystemReader(checkpoint_name)
         try:
             state_dict_metadata = reader.read_metadata().state_dict_metadata
         except FileNotFoundError:
@@ -3028,6 +3287,7 @@ def load_checkpoint(
         gen_sd_rerun_state = {}
         gen_sd_opt_param_scheduler = None
         gen_sd_rng_state = None
+        fsdp_rng_state_is_per_rank = checkpoint_group is not None
         gen_sd_optim = None
         if not args.finetune:
             if restore_training_state and 'rerun_state_machine' in state_dict_metadata:
@@ -3036,8 +3296,28 @@ def load_checkpoint(
                 )
             if not args.no_load_rng:
                 gen_sd_rng_state = get_rng_state(
-                    args.ckpt_format, tp_group, pp_group, dp_cp_group=dp_cp_group, dp_group=dp_group
+                    args.ckpt_format,
+                    tp_group,
+                    pp_group,
+                    dp_cp_group=dp_cp_group,
+                    dp_group=dp_group,
+                    checkpoint_group=checkpoint_group,
                 )
+                # Older checkpoints index RNG by TP/PP and keep DP states in a
+                # list. Preserve that load layout when a site reads an existing
+                # checkpoint copied to its filesystem.
+                legacy_key = f'({get_pg_rank(pp_group)}, {get_pg_rank(tp_group)})'
+                if checkpoint_group is not None and any(
+                    key.startswith(f'rng_state.{legacy_key}.') for key in state_dict_metadata
+                ):
+                    fsdp_rng_state_is_per_rank = False
+                    gen_sd_rng_state = get_rng_state(
+                        args.ckpt_format,
+                        tp_group,
+                        pp_group,
+                        dp_cp_group=dp_cp_group,
+                        dp_group=dp_group,
+                    )
         if (
             restore_training_state
             and (not args.finetune or gpt_compat_load_optim)
@@ -3103,6 +3383,8 @@ def load_checkpoint(
         dp_cp_group=dp_cp_group,
         expt_dp_group=expt_dp_group,
         checkpoint_group=checkpoint_group,
+        preferred_reader_ranks=preferred_reader_ranks,
+        checkpoint_parallelization_group=checkpoint_parallelization_group,
         gpt_compat_layer_maps=gpt_compat_layer_maps,
         gtp_pad_for_alignment=gtp_pad_for_alignment,
         **load_kwargs,
@@ -3442,28 +3724,18 @@ def load_checkpoint(
             cuda_rng_tracker = tensor_parallel.get_cuda_rng_tracker()
             graph_safe_rng = tensor_parallel.is_graph_safe_cuda_rng_tracker(cuda_rng_tracker)
             if 'rng_state' in state_dict:
+                site_rng = False
                 if args.ckpt_format == 'fsdp_dtensor':
-                    # FSDP DTensor checkpoints store rng_state in a different format.
-                    tp_rank = (
-                        get_pg_rank(tp_group)
-                        if tp_group is not None
-                        else mpu.get_tensor_model_parallel_rank()
-                    )
-                    pp_rank = (
-                        get_pg_rank(pp_group)
-                        if pp_group is not None
-                        else mpu.get_pipeline_model_parallel_rank()
-                    )
-                    if f'({pp_rank}, {tp_rank})' in state_dict['rng_state']:
-                        rng_state = state_dict['rng_state'][f'({pp_rank}, {tp_rank})']
-                    else:
-                        print_rank_0('WARNING: RNG state not found for current TP/PP rank')
-                        rng_state = next(iter(state_dict['rng_state'].values()))
+                    rng_key = next(iter(gen_sd_rng_state))
+                    rng_state = state_dict['rng_state'][rng_key]
+                    site_rng = fsdp_rng_state_is_per_rank
                 else:
                     rng_state = state_dict['rng_state']
 
-                # access rng_state for data parallel rank
-                if cfg.rng.data_parallel_random_init:
+                # Site checkpoints have one RNG entry per TP/PP/DP/CP rank.
+                if checkpoint_group is not None and (ckpt_format == 'torch_dist' or site_rng):
+                    rng_state = rng_state[0]
+                elif cfg.rng.data_parallel_random_init:
                     dp_rank = (
                         get_pg_rank(dp_group)
                         if dp_group is not None
@@ -3507,7 +3779,16 @@ def load_checkpoint(
 
     # Some utilities want to load a checkpoint without distributed being initialized
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        if restore_training_state and not args.finetune:
+            progress = (
+                iteration,
+                current_train_state.consumed_train_samples if current_train_state else None,
+                current_train_state.skipped_train_samples if current_train_state else None,
+                current_train_state.consumed_valid_samples if current_train_state else None,
+                num_floating_point_operations_so_far,
+            )
+            _validate_site_resume_agreement(checkpoint_group, 'restored progress', progress)
+        torch.distributed.barrier(group=checkpoint_group)
 
     _tp_r = get_pg_rank(tp_group) if tp_group is not None else mpu.get_tensor_model_parallel_rank()
     _tp_w = (

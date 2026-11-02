@@ -155,3 +155,21 @@ class TestRerunStateMachineCheckpointContract:
         sd = machine.state_dict(data_iterator=None, ckpt_format="fsdp_dtensor", force=True)
         assert sd is not None
         self._assert_sharded_object_shape(sd["sharded"])
+
+    def test_checkpoint_group_indexes_site_local_rerun_shards(self):
+        if Utils.world_size < 4 or Utils.world_size % 2:
+            return
+        group_size = Utils.world_size // 2
+        groups = [
+            torch.distributed.new_group(ranks=list(range(start, start + group_size)))
+            for start in (0, group_size)
+        ]
+        group = groups[Utils.rank // group_size]
+        machine = RerunStateMachine(mode=RerunMode.VALIDATE_RESULTS)
+
+        state = machine.state_dict(
+            data_iterator=None, ckpt_format="torch_dist", checkpoint_group=group
+        )
+        shard = state["sharded"]
+        assert shard.global_shape == (group_size,)
+        assert shard.global_offset == (torch.distributed.get_rank(group=group),)
