@@ -69,7 +69,8 @@ def test_site_resume_agreement(mismatch):
         pytest.skip("Requires two equal checkpoint domains")
     group_size = Utils.world_size // 2
     groups = [
-        dist.new_group(ranks=list(range(start, start + group_size))) for start in (0, group_size)
+        dist.new_group(ranks=list(range(start, start + group_size)))
+        for start in (0, group_size)
     ]
     group = groups[Utils.rank // group_size]
     iteration = 3
@@ -82,7 +83,9 @@ def test_site_resume_agreement(mismatch):
         checkpointing._validate_site_resume_agreement(group, "selection", (iteration, False))
     else:
         with pytest.raises(RuntimeError, match="use --ckpt-step"):
-            checkpointing._validate_site_resume_agreement(group, "selection", (iteration, False))
+            checkpointing._validate_site_resume_agreement(
+                group, "selection", (iteration, False)
+            )
 
 
 def test_site_load_detects_format_mismatch_before_loading(create_ckpt_load_args, monkeypatch):
@@ -93,7 +96,8 @@ def test_site_load_detects_format_mismatch_before_loading(create_ckpt_load_args,
         pytest.skip("Requires two equal checkpoint domains")
     group_size = Utils.world_size // 2
     groups = [
-        dist.new_group(ranks=list(range(start, start + group_size))) for start in (0, group_size)
+        dist.new_group(ranks=list(range(start, start + group_size)))
+        for start in (0, group_size)
     ]
     group = groups[Utils.rank // group_size]
     args = create_ckpt_load_args
@@ -102,7 +106,9 @@ def test_site_load_detects_format_mismatch_before_loading(create_ckpt_load_args,
     args.auto_detect_ckpt_format = True
     monkeypatch.setattr(checkpointing, "get_args", lambda: args)
     monkeypatch.setattr(
-        checkpointing, "_default_site_checkpoint_groups", lambda *a, **kw: (group, None)
+        checkpointing,
+        "_default_site_checkpoint_groups",
+        lambda *a, **kw: (group, None),
     )
     ckpt_type = CheckpointType.GLOBAL if Utils.rank < group_size else CheckpointType.LEGACY
     monkeypatch.setattr(
@@ -176,9 +182,7 @@ def test_site_checkpoint_selects_local_parallelization_group(monkeypatch):
     site_group, dp_group, expert_group = object(), object(), object()
     monkeypatch.setattr(checkpointing.mpu, "get_site_group", lambda **_: site_group)
     monkeypatch.setattr(checkpointing.mpu, "get_site_data_parallel_group", lambda **_: dp_group)
-    monkeypatch.setattr(
-        checkpointing.mpu, "get_site_expert_data_parallel_group", lambda: expert_group
-    )
+    monkeypatch.setattr(checkpointing.mpu, "get_site_expert_data_parallel_group", lambda: expert_group)
     args = SimpleNamespace(
         ckpt_format="torch_dist",
         ckpt_fully_parallel_save_process_group="dp",
@@ -1161,27 +1165,89 @@ def test_independent_training_checkpoint_domains(
     assert torch.equal(torch.get_rng_state(), expected_rng)
 
 
+@pytest.mark.parametrize("only_one_stage", [False, True])
+def test_fsdp_dtensor_checkpoint_rejects_incomplete_domain(init_model_parallel, only_one_stage):
+    """A site's checkpoint must not omit shards held by the other sites."""
+    from megatron.training import checkpointing
+
+    if Utils.world_size < 4 or Utils.world_size % 2:
+        pytest.skip("Requires two checkpoint domains")
+    group_size = Utils.world_size // 2
+    groups = [dist.new_group(list(range(start, start + group_size))) for start in (0, group_size)]
+    group = groups[Utils.rank // group_size]
+    mesh = init_device_mesh("cuda", (2, group_size), mesh_dim_names=("outer", "inner"))
+    state = {}
+    if not only_one_stage or dist.get_rank(group) == 0:
+        state["weight"] = DTensor.from_local(
+            torch.ones(1, device="cuda"),
+            mesh,
+            (Shard(0), Shard(0)),
+            shape=(Utils.world_size,),
+            stride=(1,),
+            run_check=False,
+        )
+    with pytest.raises(ValueError, match="must contain complete shards"):
+        checkpointing._validate_fsdp_dtensor_checkpoint_domain(state, group)
+
+
+@pytest.mark.parametrize("ckpt_format", ["torch_dist", "fsdp_dtensor"])
+def test_site_checkpoint_rejects_async_before_io(create_ckpt_load_args, monkeypatch, ckpt_format):
+    from megatron.training import checkpointing
+
+    args = create_ckpt_load_args
+    args.save = "unused"
+    args.use_dist_ckpt = True
+    args.ckpt_format = ckpt_format
+    args.async_save = True
+    monkeypatch.setattr(checkpointing, "get_args", lambda: args)
+    monkeypatch.setattr(checkpointing, "is_empty_async_queue", lambda: True)
+    native_save = mock.Mock()
+    monkeypatch.setattr(torch.distributed.checkpoint, "save", native_save)
+    with pytest.raises(NotImplementedError, match="NVRx AsyncRequest finalization uses WORLD"):
+        save_checkpoint(1, [], None, None, 0, checkpoint_group=object())
+    native_save.assert_not_called()
+
+
 @pytest.mark.parametrize("automatic_site_id", [False, True])
 @pytest.mark.parametrize("non_persistent", [False, True])
-@pytest.mark.parametrize("cp_size", [1, 2])
-@pytest.mark.parametrize("owned_rng", [False, True])
+@pytest.mark.parametrize(
+    "tp_size,pp_size,cp_size,owned_rng,legacy_rng",
+    [
+        (1, 1, 1, False, False),
+        (1, 1, 1, True, False),
+        (1, 1, 2, False, False),
+        (1, 1, 2, True, False),
+        (1, 1, 1, True, True),
+        (2, 1, 1, True, False),
+        (1, 2, 1, True, False),
+    ],
+)
 def test_fsdp_dtensor_site_training_checkpoint(
     init_model_parallel,
     create_ckpt_load_args,
     tmp_path_dist_ckpt,
     run_config,
+    monkeypatch,
     automatic_site_id,
     non_persistent,
+    tp_size,
+    pp_size,
     cp_size,
     owned_rng,
+    legacy_rng,
 ):
     """Native DCP preserves site-local shards, training progress and every rank's RNG."""
+    from megatron.training import checkpointing
     from megatron.training.global_vars import get_train_state
 
     if Utils.world_size < 4 or Utils.world_size % 4:
         pytest.skip("Requires a world size divisible by four")
     Utils.initialize_model_parallel(
-        1, 1, context_parallel_size=cp_size, num_distributed_optimizer_instances=2
+        tp_size,
+        pp_size,
+        context_parallel_size=cp_size,
+        num_distributed_optimizer_instances=2,
+        order="tp-cp-ep-pp-dp",
     )
     group_size = Utils.world_size // 2
     site_id = Utils.rank // group_size
@@ -1201,8 +1267,10 @@ def test_fsdp_dtensor_site_training_checkpoint(
     args.swiglu = False
     args.num_experts = None
     args.world_size = Utils.world_size
-    args.data_parallel_size = Utils.world_size // cp_size
+    args.data_parallel_size = Utils.world_size // (tp_size * pp_size * cp_size)
     args.context_parallel_size = cp_size
+    args.tensor_model_parallel_size = tp_size
+    args.pipeline_model_parallel_size = pp_size
     args.save_tokenizer_assets = False
     args.non_persistent_ckpt_type = "global" if non_persistent else None
     args.save = args.load = tmp_path_dist_ckpt / f"native_site_{site_id}"
@@ -1210,6 +1278,7 @@ def test_fsdp_dtensor_site_training_checkpoint(
     args.dataloader_save = args.save
     set_args(args)
     run_config.rng.data_parallel_random_init = owned_rng
+    monkeypatch.setattr("megatron.training.global_vars._GLOBAL_TRAIN_STATE", TrainState())
     train_state = get_train_state()
     train_state.iteration = 3
     train_state.consumed_train_samples = 24
@@ -1249,6 +1318,15 @@ def test_fsdp_dtensor_site_training_checkpoint(
         np.random.get_state(),
         {name: state.clone() for name, state in get_cuda_rng_tracker().get_states().items()},
     )
+    legacy_rng_state = None
+    if legacy_rng:
+        # Simulate an older checkpoint copied to each site's filesystem. Its
+        # TP/PP key contains the complete DP list, collected before saves stagger.
+        legacy_rng_state = checkpointing.get_rng_state(
+            "fsdp_dtensor",
+            ps.get_tensor_model_parallel_group(),
+            ps.get_pipeline_model_parallel_group(),
+        )
     # Save sites sequentially to catch accidental WORLD collectives in DCP,
     # RNG gathering, tracker finalization, or dataloader state writing.
     first_done = tmp_path_dist_ckpt / "native_first_done"
@@ -1267,18 +1345,21 @@ def test_fsdp_dtensor_site_training_checkpoint(
 
     if site_id == 1:
         wait_for(first_done)
-    save_checkpoint(
-        3,
-        [model],
-        optimizer,
-        scheduler,
-        17,
-        non_persistent_ckpt=non_persistent,
-        train_data_iterator=SimpleNamespace(
-            iterable=SimpleNamespace(save_state=lambda: {"rank": Utils.rank})
-        ),
-        checkpoint_group=None if automatic_site_id else site_group,
-    )
+    with monkeypatch.context() as saving:
+        if legacy_rng:
+            saving.setattr(checkpointing, "get_rng_state", lambda *a, **kw: legacy_rng_state)
+        save_checkpoint(
+            3,
+            [model],
+            optimizer,
+            scheduler,
+            17,
+            non_persistent_ckpt=non_persistent,
+            train_data_iterator=SimpleNamespace(
+                iterable=SimpleNamespace(save_state=lambda: {"rank": Utils.rank})
+            ),
+            checkpoint_group=None if automatic_site_id else site_group,
+        )
     save_root = args.non_persistent_global_ckpt_dir if non_persistent else args.save
     assert (save_root / "latest_checkpointed_iteration.txt").read_text() == "3"
     checkpoint_path = save_root / "iter_0000003"
