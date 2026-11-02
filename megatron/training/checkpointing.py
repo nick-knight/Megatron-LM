@@ -657,11 +657,15 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
 
 def _default_site_checkpoint_groups(args, checkpoint_group, parallelization_group, *, loading):
     """Use site-local groups for torch_dist when the caller supplied no checkpoint group."""
-    if checkpoint_group is not None or getattr(args, 'ckpt_format', None) != 'torch_dist':
+    if checkpoint_group is not None:
         return checkpoint_group, parallelization_group
     site_group = mpu.get_site_group(check_initialized=False)
     if site_group is None:
         return checkpoint_group, parallelization_group
+    if args.ckpt_format != 'torch_dist':
+        raise ValueError(
+            f'--site-id checkpointing requires --ckpt-format torch_dist; got {args.ckpt_format!r}'
+        )
     if parallelization_group is None:
         kind = (
             args.ckpt_fully_parallel_load_process_group
