@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate, Shard
 
 try:
     import emerging_optimizers  # pylint: disable=unused-import
@@ -25,6 +25,35 @@ from .dbuffer import DBuffer
 from .gather_scatter import gather, scatter
 from .owner_planning import assign_owner_work
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
+
+
+def _owner_compute_buffer(buffer: DBuffer) -> DBuffer:
+    """Expose one optimizer replica as a 1-D sharded buffer for owner computation.
+
+    HSDP replicates main weights and momentum over the outer axis. Dropping that
+    axis from the communication view preserves this rank's storage and offsets;
+    each replica gathers and scatters complete matrices on its inner mesh.
+    Persistent DTensors retain their original checkpoint layout.
+    """
+    if not isinstance(buffer, DBuffer):
+        raise ValueError("FsdpMuon requires non-quantized DBuffer optimizer buffers.")
+    if buffer.mesh.ndim == 1 and isinstance(buffer.placements[0], Shard):
+        return buffer
+    if (
+        buffer.mesh.ndim == 2
+        and isinstance(buffer.placements[0], Replicate)
+        and isinstance(buffer.placements[1], Shard)
+    ):
+        if buffer.mesh.mesh_dim_names is None:
+            raise ValueError("HSDP Muon requires named mesh dimensions.")
+        inner_mesh = buffer.mesh[buffer.mesh.mesh_dim_names[1]]
+        return DBuffer.from_local(
+            buffer.local_buffer, inner_mesh, (buffer.placements[1],), buffer.layout
+        )
+    raise NotImplementedError(
+        "FsdpMuon requires a 1-D sharded optimizer mesh or a 2-D HSDP mesh "
+        "with replicated outer and sharded inner optimizer placements."
+    )
 
 
 @dataclass(frozen=True)
@@ -55,13 +84,14 @@ class _FsdpGroupAssignment:
 # require more overrides or workarounds in FsdpMuon.
 # See https://media.pragprog.com/titles/tpp20/inheritance-tax.pdf.
 class FsdpMuon(Muon):
-    """Muon for 2-D parameters with sharded optimizer buffers on a one-dimensional DP mesh.
+    """Muon for 2-D parameters with sharded optimizer buffers, including replicated HSDP.
 
     Momentum remains sharded. Owner assignments balance orthogonalization across a
     fixed set of buffers and are computed during initialization. Each step
     gathers, orthogonalizes, scatters, and applies one buffer's updates at a time on
     the caller's CUDA stream. Full matrices exist only on their assigned owners.
-    The FSDP groups may use different meshes; owners are planned separately for each mesh.
+    The FSDP groups may use different meshes; owners are planned separately for each
+    inner mesh. Replicated HSDP's outer axis is excluded from matrix gather/scatter.
     Parameters and optimizer groups must have the same order on every DP rank, and
     ranks must agree on which parameters have gradients. Parameter membership and
     optimizer-group order must remain fixed after construction.
@@ -75,6 +105,7 @@ class FsdpMuon(Muon):
         - Non-2D parameters are skipped. Use a separate optimizer for them and for
           matrices you exclude from Muon, such as embeddings and output projections.
         - Tensor parallelism is unsupported.
+        - The outer optimizer axis must be replicated; outer-sharded HFSDP is unsupported.
 
     Args:
         *args: Positional arguments passed unchanged to EO's ``Muon``.
@@ -101,7 +132,9 @@ class FsdpMuon(Muon):
                 param_to_optimizer_group_index[param] = group_index
         self._fsdp_group_assignments = []
         for fsdp_group, tensor_to_owner_rank in zip(
-            fsdp_groups, assign_owner_work(group.main_weight for group in fsdp_groups), strict=True
+            fsdp_groups,
+            assign_owner_work(_owner_compute_buffer(group.main_weight) for group in fsdp_groups),
+            strict=True,
         ):
             self._fsdp_group_assignments.append(
                 _FsdpGroupAssignment(
@@ -120,11 +153,12 @@ class FsdpMuon(Muon):
         """Validate optimizer parameters and the FSDP buffers that contain them."""
         for assignment in self._fsdp_group_assignments:
             fsdp_group: FsdpParameterGroup = assignment.fsdp_group
-            if fsdp_group.mesh.ndim != 1:
-                raise NotImplementedError("FsdpMuon requires a one-dimensional DP mesh.")
-            for buffer in (fsdp_group.main_weight, fsdp_group.main_grad):
+            # HSDP's accumulation buffer is Partial on the outer axis until the
+            # final microbatch. Muon consumes the finalized optimizer-layout view.
+            for buffer in (fsdp_group.main_weight, fsdp_group.pre_optimizer_main_grad):
                 if not isinstance(buffer, DBuffer):
                     raise ValueError("FsdpMuon requires non-quantized main weights and gradients.")
+                _owner_compute_buffer(buffer)
 
     @torch.no_grad()
     def step(self, closure: Callable[[], float] | None = None) -> None:
@@ -169,13 +203,15 @@ class FsdpMuon(Muon):
             for i, owner in tensor_to_owner.items()
             if owner == this_rank
         }
-        gather(momentum_inputs, full_updates, tensor_to_owner=tensor_to_owner)
+        gather(
+            _owner_compute_buffer(momentum_inputs), full_updates, tensor_to_owner=tensor_to_owner
+        )
         self._orthogonalize_updates(fsdp_group, tensor_to_optimizer_group_index, full_updates)
 
         local_updates: DBuffer = DBuffer(
             buffer.mesh, buffer.placements, buffer.layout, torch.float32, buffer.device
         )
-        scatter(full_updates, local_updates, tensor_to_owner=tensor_to_owner)
+        scatter(full_updates, _owner_compute_buffer(local_updates), tensor_to_owner=tensor_to_owner)
         self._apply_local_updates(
             fsdp_group, tensor_to_optimizer_group_index, full_updates, local_updates
         )

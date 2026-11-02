@@ -496,11 +496,18 @@ def test_metadata_attach_issues_no_collectives(
     assert model_state_dict.keys() == dict(model.named_parameters()).keys()
 
 
+@pytest.mark.parametrize("instances", [1, 2], ids=["sharded", "hsdp"])
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
 @pytest.mark.parametrize("activation", ["gelu", "swiglu"])
 @pytest.mark.parametrize(("optimizer_name", "layer_pattern"), [("adam", "*E"), ("muon", "*-*E")])
 def test_ep_fsdp_checkpoint_roundtrip(
-    distributed_setup, tmp_path_dist_ckpt, ep_size, optimizer_name, layer_pattern, activation
+    distributed_setup,
+    tmp_path_dist_ckpt,
+    ep_size,
+    optimizer_name,
+    layer_pattern,
+    activation,
+    instances,
 ):
     """MCore checkpoint save/load reproduces uninterrupted BF16 MoE training.
 
@@ -510,10 +517,14 @@ def test_ep_fsdp_checkpoint_roundtrip(
     world_size, rank = Utils.world_size, Utils.rank
     if world_size % ep_size:
         pytest.skip(f"world_size {world_size} is incompatible with EP={ep_size}.")
+    if world_size // ep_size % instances:
+        pytest.skip("Expert-DP size must be divisible by optimizer instances.")
     if optimizer_name == "muon":
         pytest.importorskip("emerging_optimizers")
 
-    Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=ep_size)
+    Utils.initialize_model_parallel(
+        1, 1, expert_model_parallel_size=ep_size, num_distributed_optimizer_instances=instances
+    )
     try:
         device = torch.device("cuda", torch.cuda.current_device())
         groups = ProcessGroupCollection.use_mpu_process_groups()
@@ -559,6 +570,7 @@ def test_ep_fsdp_checkpoint_roundtrip(
                 ddp_config=DistributedDataParallelConfig(
                     use_megatron_fsdp=True,
                     megatron_fsdp_version=2,
+                    num_distributed_optimizer_instances=instances,
                     use_distributed_optimizer=True,
                     data_parallel_sharding_strategy="optim_grads_params",
                     megatron_fsdp_main_params_dtype=torch.float32,

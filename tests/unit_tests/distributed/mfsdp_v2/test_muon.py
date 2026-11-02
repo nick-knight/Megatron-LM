@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Partial, Replicate
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
@@ -61,6 +62,7 @@ def _train(
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("hsdp", [False, True], ids=["sharded", "hsdp"])
 @pytest.mark.parametrize("weight_decay_method", ["decoupled", "independent", "l2", "palm"])
 @pytest.mark.parametrize(
     "nesterov,kernel_options",
@@ -79,7 +81,7 @@ def _train(
     ],
 )
 def test_muon_matches_reference(
-    distributed_setup, dtype, weight_decay_method, nesterov, kernel_options
+    distributed_setup, dtype, weight_decay_method, nesterov, kernel_options, hsdp
 ):
     """FSDP and unsharded Muon should produce identical loss curves."""
     world_size = distributed_setup.world_size
@@ -87,7 +89,10 @@ def test_muon_matches_reference(
         pytest.skip("Requires an even number of ranks for two-rank DP meshes.")
     device = distributed_setup.device
     # With more than two GPUs, also exercise meshes whose global ranks do not start at zero.
-    mesh = init_device_mesh("cuda", (world_size // 2, 2), mesh_dim_names=("replica", "dp"))["dp"]
+    mesh = init_device_mesh("cuda", (world_size // 2, 2), mesh_dim_names=("replica", "dp"))
+    if not hsdp:
+        mesh = mesh["dp"]
+    placements = [Replicate(), RowAtomic()] if hsdp else [RowAtomic()]
     torch.manual_seed(1234)
     model = TinyModel().to(device=device, dtype=dtype)
     # Match FSDP's FP32 optimizer weights; autocast handles BF16 computation.
@@ -98,10 +103,10 @@ def test_muon_matches_reference(
             model,
             mesh=mesh,
             placements=Placements(
-                dp_axes=[0],
-                parameter=[RowAtomic()],
-                gradient=[RowAtomic()],
-                optimizer=[RowAtomic()],
+                dp_axes=list(range(mesh.ndim)),
+                parameter=placements,
+                gradient=[Partial("avg"), RowAtomic()] if hsdp else placements,
+                optimizer=placements,
             ),
         )
     params = dict(model.named_parameters())
@@ -115,6 +120,10 @@ def test_muon_matches_reference(
     excluded_names = ["block2.3.weight", "block2.3.bias"]
     muon_names = [name for name in params if name not in excluded_names]
     optimizer = muon.FsdpMuon([params[name] for name in muon_names], **kwargs)
+    if hsdp:
+        inner_ranks = set(mesh["dp"].mesh.tolist())
+        for assignment in optimizer._fsdp_group_assignments:
+            assert set(assignment.tensor_to_owner_rank.values()) <= inner_ranks
     fully_shard_optimizer(optimizer, precision_aware=True)
     reference_optimizer = Muon([reference_params[name] for name in muon_names], **kwargs)
     other_optimizer = torch.optim.SGD([params[n] for n in excluded_names], lr=0.01, foreach=False)
